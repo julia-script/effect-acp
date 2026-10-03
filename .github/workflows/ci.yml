@@ -18,6 +18,12 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # Changesets compares against a local main ref, which PR checkouts lack.
+      - name: Prepare Changesets base branch
+        if: github.event_name == 'pull_request'
+        run: git branch main origin/main
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.2
