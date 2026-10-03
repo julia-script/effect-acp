@@ -166,7 +166,7 @@
     "dist",
     "src"
   ],
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Effect-native clients and agent authoring for the Agent Client Protocol",
   "license": "MIT",
   "author": "Julia Ortiz",
