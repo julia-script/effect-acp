@@ -43,13 +43,26 @@ npm install @effect/platform-node
 
 Browser clients use web APIs and injected services. The package ships ESM JavaScript and TypeScript declarations, with explicit subpath exports.
 
-## Your first session
+## Your first session with Claude
 
-The [first-session tutorial](docs/tutorials/first-session.md#2-save-the-agent) includes a small echo agent you can run without an account, API key, or model download. Save its `echo-agent.ts` in your project directory, then save the client below as `first-session.ts` beside it.
+This example starts the [Claude ACP adapter](https://github.com/agentclientprotocol/claude-agent-acp), asks Claude a question, and prints its reply. You need Bun, Node.js 22 or newer, and an Anthropic API key.
 
-The client starts the agent, connects, opens a session, and sends a prompt. Once the turn finishes, it prints the agent’s reply.
+Install the client dependencies and the adapter in your project directory:
 
-<!-- example: docs/examples/first-session.ts -->
+```sh
+bun add effect-acp effect @effect/platform-bun
+bun add --dev @agentclientprotocol/claude-agent-acp@0.79.0
+```
+
+The adapter provides the `claude-agent-acp` executable used below. Set your API key in the shell where you will run the client; the child process inherits it. See the [Claude Agent SDK authentication setup](https://code.claude.com/docs/en/agent-sdk/quickstart#set-your-api-key) for other providers.
+
+```sh
+export ANTHROPIC_API_KEY="your-api-key"
+```
+
+Save this as `claude-session.ts` in the same directory:
+
+<!-- example: docs/examples/claude-session.ts -->
 ```ts
 import * as BunRuntime from "@effect/platform-bun/BunRuntime"
 import * as BunServices from "@effect/platform-bun/BunServices"
@@ -61,8 +74,8 @@ import { AcpClient } from "effect-acp/AcpClient"
 import * as AcpLocalClient from "effect-acp/AcpLocalClient"
 import * as Stdio from "effect-acp/transport/Stdio"
 
-// Start the echo agent and communicate over its stdin/stdout.
-const agentProcess = ChildProcess.make("bun", ["echo-agent.ts"], {
+// Start the locally installed Claude ACP adapter over stdin/stdout.
+const agentProcess = ChildProcess.make("./node_modules/.bin/claude-agent-acp", [], {
   forceKillAfter: "2 seconds"
 })
 
@@ -72,39 +85,38 @@ const ClientLive = AcpLocalClient.layer.pipe(
 )
 
 const program = Effect.gen(function*() {
-  // 1. Connect to the agent.
+  // 1. Connect to Claude using ACP v1.
   const client = yield* AcpClient
   const connection = yield* client.connect({
-    versions: [2, 1],
-    params: {
-      info: { name: "first-session", version: "1.0.0" },
-      capabilities: {}
-    },
-    timeout: "10 seconds"
+    versions: [1],
+    params: { clientInfo: { name: "claude-session", version: "1.0.0" } },
+    timeout: "30 seconds",
+    interactionTimeout: "30 seconds"
   })
   yield* Console.log(`Connected using ACP v${connection.capabilities.version}`)
 
   // 2. Open a session in the current directory.
   const session = yield* connection.newSession({ cwd: process.cwd() })
 
-  // 3. Send a prompt and wait for the agent to finish its turn.
-  const submission = yield* session.submit([{ type: "text", text: "Hello ACP" }])
+  // 3. Ask a question that needs no file access or tool permissions.
+  const submission = yield* session.submit([{
+    type: "text",
+    text: "Explain Effect scopes in two sentences. Do not read files, run commands, or use tools."
+  }])
   yield* submission.outcome
 
-  // 4. Read the completed reply from the session snapshot.
+  // 4. Print Claude's completed reply from the session snapshot.
   const snapshot = yield* session.snapshot
   for (const message of snapshot.messages) {
     if (message.kind !== "agent") continue
 
-    // Join the text chunks that make up each agent message.
     const text = message.content
       .flatMap((block) =>
         "text" in block && typeof block.text === "string" ? [block.text] : []
       )
       .join("")
-    yield* Console.log(`Agent: ${text}`)
+    yield* Console.log(`Claude: ${text}`)
   }
-  yield* Console.log(`Turn state: ${snapshot.foreground.state}`)
 })
 
 if (import.meta.main) {
@@ -116,23 +128,17 @@ if (import.meta.main) {
 }
 ```
 
-Run the client from that directory:
+Run it from your project directory:
 
 ```sh
-bun first-session.ts
+bun claude-session.ts
 ```
 
-Expected output:
+The client prints `Connected using ACP v1`, followed by Claude's answer. The response text varies by model.
 
-```text
-Connected using ACP v2
-Agent: Echo: Hello ACP
-Turn state: idle
-```
+`submission.outcome` waits for the foreground turn to finish. The session retains its current snapshot; use `session.observe` to acquire a snapshot and the stream of changes that follows it. For prompts that use coding tools, the [session UI guide](docs/how-to/session-ui.md) shows how to handle streaming updates and permission requests.
 
-`submission.outcome` waits for the foreground turn to finish. The session retains its current snapshot; use `session.observe` to acquire a snapshot and the stream of changes that follows it. The [session UI guide](docs/how-to/session-ui.md) shows streaming updates and permission handling.
-
-The example explicitly enables ACP v2 and v1. Connections default to **ACP v1**; the v2 draft is opt-in, with version-specific payloads validated by generated schemas.
+See [Claude and Codex setup](docs/how-to/real-agents.md) for more agent options, or the [first-session tutorial](docs/tutorials/first-session.md) for an echo-agent walkthrough that needs no credentials.
 
 ## Choose where the session lives
 
