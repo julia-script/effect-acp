@@ -164,18 +164,21 @@ const textBytes = (value: string) => new TextEncoder().encode(value).byteLength
 const canonicalValue = (value: Schema.Json): Schema.Json => {
   if (Array.isArray(value)) return value.map(canonicalValue)
   if (value !== null && typeof value === "object") return Object.fromEntries(
-    Object.entries(value).sort(([a], [b]) => a.localeCompare(b)).map(([key, item]) => [key, canonicalValue(item)]))
+    Object.entries(value).sort(([a], [b]) => {
+      if (a === b) return 0
+      return a < b ? -1 : 1
+    }).map(([key, item]) => [key, canonicalValue(item)]))
   return value
 }
 // Serialize before traversing: cycles and BigInt fail before ledger admission.
 const canonical = (value: unknown) => Json.encode(value).pipe(
   Effect.flatMap(Json.decode),
   Effect.flatMap((decoded) => Json.encode(canonicalValue(decoded))),
-  Effect.tapCause((cause) => Cause.hasInterruptsOnly(cause) ? Effect.void : Effect.logError("Cannot serialize hosted command", cause)),
+  Effect.tapCause((cause) => Cause.hasInterruptsOnly(cause) ? Effect.void : Effect.logError("Cannot serialize hosted command")),
   Effect.mapError(() => AcpGateway.failure("Invalid"))
 )
 const hostedId = randomUUID.pipe(
-  Effect.tapCause((cause) => Cause.hasInterruptsOnly(cause) ? Effect.void : Effect.logError("Cannot generate hosted ID", cause)),
+  Effect.tapCause((cause) => Cause.hasInterruptsOnly(cause) ? Effect.void : Effect.logError("Cannot generate hosted ID")),
   Effect.mapError(() => AcpGateway.failure("Invalid"))
 )
 const safe = (cause: Cause.Cause<unknown>) => {
@@ -287,7 +290,7 @@ export const make = <R, E>(options: Options<R, E>) => Effect.gen(function*() {
     const event: AcpGateway.Frame & { _tag: "Event" } = { _tag: "Event", cursor: cursor(session, ++session.sequence), snapshot }
     const encoded = yield* Json.encode(event).pipe(Effect.result)
     if (Result.isFailure(encoded)) {
-      yield* Effect.logError("Cannot serialize hosted session snapshot", Cause.fail(encoded.failure))
+      yield* Effect.logError("Cannot serialize hosted session snapshot")
       return yield* expire(session)
     }
     const size = textBytes(encoded.success)
@@ -439,7 +442,7 @@ export const make = <R, E>(options: Options<R, E>) => Effect.gen(function*() {
       Effect.matchCauseEffect({
         onSuccess: (result) => Effect.sync(() => { record.value = { ...record.value, status: "succeeded", result: result ?? null } }),
         onFailure: (cause) => Cause.hasInterruptsOnly(cause) ? Effect.failCause(cause) : Effect.andThen(
-          Effect.logError("Hosted operation failed", cause),
+          Effect.logError("Hosted operation failed"),
           Effect.sync(() => {
             const failure = safe(cause)
             record.value = { ...record.value, status: failure._tag === "AcpGatewayError" && failure.code === "OutcomeUnknown" ? "outcomeUnknown" : "failed", error: failure }
@@ -460,26 +463,37 @@ export const make = <R, E>(options: Options<R, E>) => Effect.gen(function*() {
   const attach = (identity: AcpGateway.Identity, input: AcpGateway.AttachmentRequest) => Stream.unwrap(Effect.gen(function*() {
     yield* checkEpoch(input.epoch)
     const session = yield* sessionFor(identity, input.workspace, input.session, input.takeover ? "takeover" : "attach")
-    const requested = input.cursor
-    if (requested && (requested.epoch !== epoch || requested.session !== session.id || requested.sequence < 0 || requested.sequence > session.sequence)) return yield* AcpGateway.failure("Invalid")
-    if (session.controller && !input.takeover) return yield* AcpGateway.failure("Conflict")
-    const queue = yield* Queue.bounded<AcpGateway.Frame, AcpGateway.GatewayError | Cause.Done>(policy.subscriberCapacity)
-    const previous = session.controller
-    const generation = ++session.generation
-    session.controller = { clientId: input.clientId, generation, queue }
-    // Capture boundary and replay synchronously before any scheduling or timer cancellation.
-    const resync = requested !== undefined && requested.sequence < session.floor
-    const initial: AcpGateway.Frame = { _tag: "Attached", cursor: cursor(session), generation, resync,
-      snapshot: !requested || resync ? session.snapshot : null }
-    const replay = requested && !resync ? session.journal.filter(({ event }) => event.cursor.sequence > requested.sequence).map(({ event }) => event) : []
-    if (previous) yield* Queue.fail(previous.queue, AcpGateway.failure("StaleController"))
-    yield* Effect.addFinalizer(() => Effect.gen(function*() {
-      if (session.controller?.generation === generation) {
-        delete session.controller
-        yield* report("detached")
-        if (!session.closing) yield* scheduleExpiry(session)
-      }
-      yield* Queue.shutdown(queue)
+    const queue = yield* Effect.acquireRelease(
+      Queue.bounded<AcpGateway.Frame, AcpGateway.GatewayError | Cause.Done>(policy.subscriberCapacity), Queue.shutdown)
+    const { initial, replay } = yield* Effect.uninterruptible(Effect.gen(function*() {
+      // Validate authoritative metadata, replace control, and capture the observation
+      // boundary synchronously. Authorization remains outside this masked transition.
+      const { previous, generation, initial, replay } = yield* Effect.suspend(() => {
+        if (sessions.get(session.id) !== session || session.closing) return Effect.fail(AcpGateway.failure("Closed"))
+        if (input.expected && (input.expected.sessionId !== session.handle.sessionId || input.expected.version !== session.handle.version)) {
+          return Effect.fail(AcpGateway.failure("Invalid"))
+        }
+        const requested = input.cursor
+        if (requested && (requested.epoch !== epoch || requested.session !== session.id || requested.sequence < 0 || requested.sequence > session.sequence)) return Effect.fail(AcpGateway.failure("Invalid"))
+        if (session.controller && !input.takeover) return Effect.fail(AcpGateway.failure("Conflict"))
+        const previous = session.controller
+        const generation = ++session.generation
+        session.controller = { clientId: input.clientId, generation, queue }
+        const resync = requested !== undefined && requested.sequence < session.floor
+        const initial: AcpGateway.Frame = { _tag: "Attached", cursor: cursor(session), generation, resync,
+          snapshot: !requested || resync ? session.snapshot : null }
+        const replay = requested && !resync ? session.journal.filter(({ event }) => event.cursor.sequence > requested.sequence).map(({ event }) => event) : []
+        return Effect.succeed({ previous, generation, initial, replay })
+      })
+      yield* Effect.addFinalizer(() => Effect.gen(function*() {
+        if (session.controller?.generation === generation) {
+          delete session.controller
+          yield* report("detached")
+          if (!session.closing) yield* scheduleExpiry(session)
+        }
+      }))
+      if (previous) yield* Queue.fail(previous.queue, AcpGateway.failure("StaleController"))
+      return { initial, replay }
     }))
     if (session.expiry) { const timer = session.expiry; delete session.expiry; yield* Fiber.interrupt(timer) }
     yield* report("attached")
@@ -489,7 +503,7 @@ export const make = <R, E>(options: Options<R, E>) => Effect.gen(function*() {
     yield* checkEpoch(input.epoch)
     const owner = yield* ownerFor(identity, input.workspace, input.connection)
     return yield* owner.connection.listSessions(input.cwd).pipe(
-      Effect.tapCause((cause) => Cause.hasInterruptsOnly(cause) ? Effect.void : Effect.logError("Hosted session list failed", cause)),
+      Effect.tapCause((cause) => Cause.hasInterruptsOnly(cause) ? Effect.void : Effect.logError("Hosted session list failed")),
       Effect.mapError(() => AcpGateway.failure("AgentFailure")))
   })
   yield* Effect.addFinalizer(() => Effect.sync(() => { stopping = true }))

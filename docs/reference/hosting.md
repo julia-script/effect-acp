@@ -12,6 +12,8 @@ Scope: `AcpHost`, `AcpGateway`, `AcpGatewayClient`, `AcpRemoteClient`, and `serv
 
 `onLifecycle` receives event type (`opened`, `attached`, `detached`, `expired`, `admitted`, `settled`) and connection/session/command counts. It contains no prompt or filesystem bodies.
 
+Default host and gateway diagnostics report failure categories without attaching internal error causes or messages. Applications that need private diagnostics can record them inside their own callbacks with their own redaction policy.
+
 ## Policy
 
 Every field is required and must be a positive safe integer. There are no default policy values.
@@ -72,7 +74,11 @@ Values must round-trip as structured data. Saves of operation admission data com
 
 A session descriptor contains `epoch`, host `session`, agent `sessionId`, and ACP `version`. `AcpGateway.SessionDescriptor` is its schema. Host session IDs and agent session IDs are distinct namespaces.
 
-Only one controller attaches at a time. Explicit authorized takeover advances a generation and revokes stale writes. Reattaching cancels the detached-session expiry timer. Pending decisions remain pending until answered or expired; reconnection never auto-approves them.
+Terminal authentication runs the host application's `terminalAuth` callback and closes the original ACP connection after success. The remote client's `authenticate(methodId)` then removes that connection's retained descriptor. Call `connect` again on the same remote client, or construct a new remote client with the same storage and connection key, to open a fresh host connection and initialize ACP with the updated credentials. Old connection and session handles remain closed. Agent authentication keeps the connection and its retained descriptor. Gateway disconnection alone does not discard retained recovery state.
+
+Only one controller attaches at a time. Explicit authorized takeover advances a generation and revokes stale writes. Remote attachments send expected agent session ID and protocol version, which the host checks before replacing a controller. A mismatched descriptor fails with `Invalid` and leaves the existing controller active. Reattaching cancels the detached-session expiry timer. Pending decisions remain pending until answered or expired; reconnection never auto-approves them.
+
+Direct gateway callers should supply `AttachmentRequest.expected` with `{ sessionId, version }` from the saved descriptor. The check and controller replacement share one host transition. The field is optional for compatibility with older direct gateway clients.
 
 ## Operation recovery
 

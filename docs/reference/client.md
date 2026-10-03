@@ -17,6 +17,7 @@ Connection scope owns direct session runtimes. A session handle does not extend 
 | `timeout` | No deadline | Deadline for initialization, including its send; not a global prompt timeout. |
 | `v1Handlers` | None | Implemented filesystem/terminal callbacks; ignored on v2. |
 | `terminalAuth` | None | Callback that executes an advertised terminal authentication invocation. Enables advertising that capability. |
+| `onElicitation` | None | Answers connection request-scoped elicitation; receives the original request and selected version. |
 | `limits` | See below | Partial overrides for retained content budgets. |
 | `provisional` | 128 updates, 4 MiB | Bounds updates arriving during session creation/resume before routing is established. |
 | `observerCapacity` | 256 | Events buffered for each observer. |
@@ -25,7 +26,9 @@ Connection scope owns direct session runtimes. A session handle does not extend 
 
 `v1Handlers` has `readTextFile`, `writeTextFile`, `createTerminal`, `terminalOutput`, `waitForTerminalExit`, `killTerminal`, and `releaseTerminal`. Their requests/results use the corresponding v1 schemas. These callbacks expose neither an environment requirement nor a typed error channel; application dependencies must be supplied when constructing them. Only installed capabilities are advertised. An application must implement its own filesystem and terminal access policy.
 
-The `terminalAuth` callback receives the agent's version-specific terminal-auth method. Calling `authenticate` runs that callback before the protocol authentication request. Without it, terminal methods are not considered usable.
+The `terminalAuth` callback receives the agent's version-specific terminal-auth method. After it succeeds, `authenticate` closes the original local connection and releases its session runtimes. Call `AcpClient.connect` again to acquire and initialize a fresh connection with the new credentials. Terminal methods are never sent through `authenticate` or `auth/login` on the wire. Without the callback, terminal methods are not considered usable.
+
+Elicitation modes must be explicitly advertised through `params.clientCapabilities.elicitation` on v1 or `params.capabilities.elicitation` on v2, for example `{ form: {}, url: {} }`. Omitted, null, and unadvertised modes are rejected with `Invalid params` before an interaction or callback starts. Session-scoped requests appear in that session's interactions. Request-scoped requests call `onElicitation(request, version)` with their original `requestId`, URL elicitation ID, and metadata, without attribution to any session. Return `{ _tag: "accept", content? }`, `{ _tag: "decline" }`, or `{ _tag: "cancel" }`. Without a callback these requests receive cancellation. Callback failures receive a generic protocol error. Request cancellation, URL completion withdrawal, and `interactionTimeout` interrupt a pending callback and release its bounded admission slot. Supply callback dependencies before passing the callback; it has no environment requirement.
 
 ## AcpAgentConnection
 
@@ -37,7 +40,7 @@ The `terminalAuth` callback receives the agent's version-specific terminal-auth 
 | `newSession(options)` | Creates a session and returns its handle. |
 | `resumeSession(options)` | Returns a handle for an existing agent session. History requirements may fail with `AcpHistoryUnavailable`. |
 | `listSessions(cwd?)` | Session summaries where supported. The local implementation fetches one page; it does not iterate the agent's pagination cursor. |
-| `authenticate(methodId)` | Selects an advertised usable authentication method. |
+| `authenticate(methodId)` | Selects an advertised method. Terminal success closes the local connection; connect again to initialize with the new credentials. |
 | `logout` | Agent logout, where advertised. |
 | `request(method, params?)` | Raw extension escape hatch; result is `unknown` until validated by an application schema. |
 
@@ -93,6 +96,8 @@ Each observation is `{ _tag: "snapshot", snapshot }`. The stream is ordered and 
 | `interactions` | 64 |
 
 Older retained content is discarded when budgets are exceeded, with `truncated` markers. Pending interactions are subject to admission bounds and are not silently evicted. A snapshot is a bounded projection, not an archival conversation log. v1 message identities are synthesized locally and marked with local provenance.
+
+Tool-call content retains the negotiated version's diff shape: v1 uses `oldText`/`newText`, and v2 uses structured changes. A v1 null or omitted tool name preserves its previous value; v2 null clears it. Terminal snapshots expose `exited` separately from nullable `exitCode` and `exitSignal`, so a concrete exit status with unknown details remains observable. Newly projected and decoded snapshots include that boolean; older serialized snapshots missing it decode with `false`.
 
 ## Failures
 

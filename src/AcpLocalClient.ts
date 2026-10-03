@@ -333,6 +333,7 @@ const connect = Effect.fnUntraced(function*(options: ConnectOptions) {
   const routes = new Map<string, Route>()
   // Sessions the connection owns; released with the connection's scope.
   const sessionScopes = new Map<string, Scope.Closeable>()
+  const requestElicitations = new Map<string, { readonly elicitationId?: string; readonly cancelled: Deferred.Deferred<void> }>()
   let nextLocalId = 0
   const localId = (prefix: string) => `${prefix}-${nextLocalId++}`
 
@@ -493,6 +494,38 @@ const connect = Effect.fnUntraced(function*(options: ConnectOptions) {
     return routes
   }
 
+  const onRequestElicitation = (version: 1 | 2, params: unknown): Effect.Effect<InteractionOutcome, AcpRemoteError> =>
+    Effect.gen(function*() {
+      const request = yield* Schema.decodeUnknownEffect(Schema.Union([V1.CreateElicitationRequest, V2.CreateElicitationRequest]))(params).pipe(
+        Effect.mapError(() => new AcpRemoteError({ code: ErrorCode.InvalidParams, message: "Invalid elicitation request" })))
+      if (!Schema.is(V1.ElicitationRequestScope)(request)) return yield* new AcpRemoteError({ code: ErrorCode.InvalidParams, message: "Missing elicitation request identity" })
+      const size = Json.byteLength(request)
+      if (Result.isFailure(size) || size.success > (limits.transcriptBytes ?? 4 * 1024 * 1024) / (limits.interactions + 1)) {
+        return yield* new AcpRemoteError({ code: ErrorCode.InvalidRequest, message: "Interaction capacity exceeded" })
+      }
+      if (options.onElicitation === undefined) return { action: "cancel" }
+      const register = Semaphore.withPermit(routingLock, Effect.gen(function*() {
+        if (requestElicitations.size >= limits.interactions) return yield* new AcpRemoteError({ code: ErrorCode.InvalidRequest, message: "Interaction capacity exceeded" })
+        const key = localId("request-elicitation")
+        const cancelled = yield* Deferred.make<void>()
+        requestElicitations.set(key, {
+          ...("elicitationId" in request && typeof request.elicitationId === "string" ? { elicitationId: request.elicitationId } : {}), cancelled
+        })
+        return { key, cancelled }
+      }))
+      // Admission and cleanup form one resource boundary, including interruption during admission.
+      return yield* Effect.acquireUseRelease(register, ({ cancelled }) => {
+        const callback = Effect.suspend(() => options.onElicitation!(request, version)).pipe(
+          Effect.map((resolution) => encodeResolution("elicitation", resolution)),
+          Effect.catchCause((cause) => Cause.hasInterruptsOnly(cause) ? Effect.interrupt
+            : Effect.fail(new AcpRemoteError({ code: ErrorCode.InternalError, message: "Elicitation handler failed" }))))
+        const waiting = Effect.raceFirst(callback, Deferred.await(cancelled).pipe(Effect.as<InteractionOutcome>({ action: "cancel" })))
+        return options.interactionTimeout === undefined ? waiting : waiting.pipe(Effect.timeoutOrElse({
+          duration: options.interactionTimeout, orElse: () => Effect.succeed<InteractionOutcome>({ action: "cancel" })
+        }))
+      }, ({ key }) => Effect.sync(() => { requestElicitations.delete(key) }))
+    })
+
   const handlers = (negotiated: AcpProtocol.Negotiated): AcpConnection.Handlers => {
     const version = negotiated.version
     const dispatch = AcpConnection.handlers(v1HandlerRoutes(negotiated), {
@@ -500,9 +533,14 @@ const connect = Effect.fnUntraced(function*(options: ConnectOptions) {
         switch (method) {
           case "session/request_permission":
             return onInteraction("permission", version, params, sessionIdOf(params))
-          case "elicitation/create":
-            // v2 elicitation is connection-scoped unless it names a session.
-            return onInteraction("elicitation", version, params, sessionIdOf(params) ?? soleLiveSession())
+          case "elicitation/create": {
+            if (!isRecord(params) || typeof params.mode !== "string" || !Capability.elicitationSupported(negotiated, params.mode)) {
+              return Effect.fail(new AcpRemoteError({ code: ErrorCode.InvalidParams, message: "Elicitation mode was not advertised" }))
+            }
+            // A request identity remains connection-scoped, even when there is one live session.
+            return "requestId" in params ? onRequestElicitation(version, params)
+              : onInteraction("elicitation", version, params, sessionIdOf(params))
+          }
           default:
             return undefined
         }
@@ -512,11 +550,13 @@ const connect = Effect.fnUntraced(function*(options: ConnectOptions) {
           case "session/update":
             return onUpdate(params)
           case "elicitation/complete": {
+            const elicitationId = isRecord(params) && typeof params.elicitationId === "string" ? params.elicitationId : undefined
+            const cancelled = [...requestElicitations.values()].filter((entry) => entry.elicitationId === elicitationId)
             // The agent withdrew the request; settle it as cancelled.
             const sessionId = sessionIdOf(params) ?? soleLiveSession()
             const route = sessionId === undefined ? undefined : routes.get(sessionId)
-            if (route === undefined || route._tag !== "live") return Effect.void
-            return Effect.ignore(withdrawElicitations(route.runtime, isRecord(params) && typeof params.elicitationId === "string" ? params.elicitationId : undefined))
+            return Effect.andThen(Effect.forEach(cancelled, (entry) => Deferred.succeed(entry.cancelled, undefined), { discard: true }),
+              route === undefined || route._tag !== "live" ? Effect.void : Effect.ignore(withdrawElicitations(route.runtime, elicitationId)))
           }
           default:
             return undefined
@@ -589,7 +629,9 @@ const connect = Effect.fnUntraced(function*(options: ConnectOptions) {
       params: { ...params, capabilities: { ...params.capabilities, auth } }, handlers
     }
   }).pipe(Effect.mapError(invalidInitialize))
-  const { connection, negotiated } = yield* AcpProtocol.connect(connectOptions)
+  const protocolScope = yield* Scope.fork(scope)
+  const { connection, negotiated } = yield* Scope.provide(AcpProtocol.connect(connectOptions), protocolScope).pipe(
+    Effect.onExit((exit) => Exit.isFailure(exit) ? Scope.close(protocolScope, exit) : Effect.void))
   const capabilities = Capability.normalize(negotiated, negotiated.advertised.version === 1 ? installed : { filesystem: false, terminal: false })
   const version = negotiated.version
 
@@ -992,6 +1034,7 @@ const connect = Effect.fnUntraced(function*(options: ConnectOptions) {
 
   const authenticate = (methodId: string) =>
     Effect.gen(function*() {
+      if (protocolScope.state._tag === "Closed") return yield* new AcpConnectionClosed({ message: "Connection released after terminal authentication" })
       if (!capabilities.auth.methods.includes(methodId)) {
         return yield* unsupported("authenticate", `Unknown auth method ${methodId}`)
       }
@@ -1000,7 +1043,23 @@ const connect = Effect.fnUntraced(function*(options: ConnectOptions) {
       // agent's command would strand the user, so require the callback.
       if (method && "type" in method && method.type === "terminal" && Schema.is(Schema.Union([V1.AuthMethodTerminal, V2.AuthMethodTerminal]))(method)) {
         if (options.terminalAuth === undefined) return yield* unsupported("authenticate", "Terminal authentication requires a terminalAuth callback")
-        yield* options.terminalAuth(method)
+        return yield* Semaphore.withPermit(lifecycleLock, Effect.gen(function*() {
+          if (protocolScope.state._tag === "Closed") return yield* new AcpConnectionClosed({ message: "Connection released after terminal authentication" })
+          yield* options.terminalAuth!(method)
+          // Terminal login changes credentials outside ACP. This transport cannot be reinitialized;
+          // invalidate it and let the owner establish a fresh initialized connection.
+          yield* Effect.uninterruptible(Effect.gen(function*() {
+            yield* Scope.close(protocolScope, Exit.void)
+            const owned = yield* Semaphore.withPermit(routingLock, Effect.sync(() => {
+              const owned = [...sessionScopes.values()]
+              routes.clear()
+              sessionScopes.clear()
+              pendingNew.clear()
+              return owned
+            }))
+            yield* Effect.forEach(owned, (sessionScope) => Scope.close(sessionScope, Exit.void), { discard: true })
+          }))
+        }))
       }
       return yield* Effect.asVoid(
         request(version === 2 ? V2.agentMethods["auth/login"] : V1.agentMethods.authenticate, { methodId })

@@ -368,6 +368,10 @@ export interface AcpAgentConnection {
 
   /**
    * Authenticates with one of the advertised methods.
+   *
+   * Terminal authentication runs the installed callback and closes this connection and its local
+   * sessions. Call `AcpClient.connect` again to initialize a fresh connection after it succeeds.
+   * Terminal methods are never passed to the protocol login request.
    */
   readonly authenticate: (methodId: string) => Effect.Effect<void, OperationError>
 
@@ -450,6 +454,22 @@ export interface V1Handlers {
 export type TerminalAuthCallback = (method: V1.AuthMethodTerminal | V2.AuthMethodTerminal) => Effect.Effect<void, never>
 
 /**
+ * Handles elicitation correlated to a connection request rather than a session.
+ *
+ * **Details**
+ *
+ * The original request retains its `requestId`, mode, URL elicitation identity and metadata.
+ * The Effect is interrupted on request cancellation, completion withdrawal, or its configured
+ * interaction deadline. Callback failures become a generic protocol error.
+ *
+ * @category models
+ */
+export type ElicitationCallback = (
+  request: (V1.CreateElicitationRequest | V2.CreateElicitationRequest) & V1.ElicitationRequestScope,
+  version: AcpProtocol.Version
+) => Effect.Effect<ElicitationResolution, Error>
+
+/**
  * Protocol initialization and local session runtime configuration.
  *
  * **Details**
@@ -469,6 +489,11 @@ export type ConnectOptions = AcpProtocol.InitializeOptions & {
    * Enables advertising terminal authentication methods.
    */
   readonly terminalAuth?: TerminalAuthCallback | undefined
+  /**
+   * Answers request-scoped elicitation without assigning it to a session. Advertise supported
+   * modes explicitly in initialize params. Without a callback these requests are cancelled.
+   */
+  readonly onElicitation?: ElicitationCallback | undefined
   /**
    * Retained-content budgets. Defaults are finite; see `defaultContentLimits`.
    */

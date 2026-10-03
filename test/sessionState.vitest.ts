@@ -4,7 +4,10 @@
  * these pin the interpretation rules on their own.
  */
 import { describe, expect, it } from "@effect/vitest"
-import { defaultContentLimits, type SubmissionSnapshot } from "../src/AcpApp.ts"
+import { defaultContentLimits, SessionSnapshot, TerminalSnapshot, type SubmissionSnapshot } from "../src/AcpApp.ts"
+import * as Schema from "effect/Schema"
+import * as V1 from "../src/protocol/v1/Schema.ts"
+import * as V2 from "../src/protocol/v2/Schema.ts"
 import * as State from "../src/AcpSessionState.ts"
 
 const v2 = () => State.empty("sess-1", 2)
@@ -22,6 +25,50 @@ const submission = (id: string, overrides: Partial<SubmissionSnapshot> = {}): Su
   acceptanceUnavailable: false,
   foreground: "inferred",
   ...overrides
+})
+
+describe("versioned tool and terminal projections", () => {
+  it("preserves mixed v1 content and diffs on introduction and replacement", () => {
+    const diff = { type: "diff", path: "/work/a.ts", oldText: "old", newText: "new" }
+    const content = [{ type: "content", content: text("result") }, diff]
+    const initial = { sessionUpdate: "tool_call", toolCallId: "edit", title: "Edit", content }
+    expect(Schema.is(V1.SessionUpdate)(initial)).toBe(true)
+    const seeded = State.reduce(v1(), update(initial))
+    expect(seeded.toolCalls.edit!.content).toEqual(content)
+    const replaced = State.reduce(seeded, update({ sessionUpdate: "tool_call_update", toolCallId: "edit", content: [diff] }))
+    expect(replaced.toolCalls.edit!.content).toEqual([diff])
+    expect(Schema.is(SessionSnapshot)(replaced)).toBe(true)
+  })
+
+  it("keeps v1 null and omitted names, while concrete names replace", () => {
+    const seeded = State.reduce(v1(), update({ sessionUpdate: "tool_call", toolCallId: "edit", title: "Edit", name: "edit_file" }))
+    const patch = { sessionUpdate: "tool_call_update", toolCallId: "edit", name: null }
+    expect(Schema.is(V1.SessionUpdate)(patch)).toBe(true)
+    const unchanged = State.reduceAll(seeded, [update(patch), update({ sessionUpdate: "tool_call_update", toolCallId: "edit", status: "completed" })])
+    expect(unchanged.toolCalls.edit!.name).toBe("edit_file")
+    const replaced = State.reduce(unchanged, update({ sessionUpdate: "tool_call_update", toolCallId: "edit", name: "write_file" }))
+    expect(replaced.toolCalls.edit!.name).toBe("write_file")
+  })
+
+  it("represents unknown terminal exits independently of nullable exit details", () => {
+    const seeded = State.reduce(v2(), update({ sessionUpdate: "terminal_update", terminalId: "tty", command: "run" }))
+    expect(seeded.terminals.tty!.exited).toBe(false)
+    for (const exitStatus of [{}, { exitCode: null, signal: null }]) {
+      const patch = { sessionUpdate: "terminal_update", terminalId: "tty", exitStatus }
+      expect(Schema.is(V2.SessionUpdate)(patch)).toBe(true)
+      const exited = State.reduce(seeded, update(patch))
+      expect(exited.terminals.tty).toMatchObject({ exited: true, exitCode: null, exitSignal: null })
+      const appended = State.reduce(exited, update({ sessionUpdate: "terminal_output_chunk", terminalId: "tty", data: "YQ==" }))
+      expect(appended.terminals.tty!.exited).toBe(true)
+      const preserved = State.reduce(appended, update({ sessionUpdate: "terminal_update", terminalId: "tty", cwd: "/work" }))
+      expect(preserved.terminals.tty!.exited).toBe(true)
+      const reset = State.reduce(preserved, update({ sessionUpdate: "terminal_update", terminalId: "tty", exitStatus: null }))
+      expect(reset.terminals.tty!.exited).toBe(false)
+    }
+    const legacy = { ...seeded.terminals.tty! }
+    delete legacy.exited
+    expect(Schema.decodeSync(TerminalSnapshot)(legacy).exited).toBe(false)
+  })
 })
 
 describe("v2 messages", () => {

@@ -57,7 +57,7 @@ export const route = <R>(options: Options<R>) => HttpRouter.route("GET", options
     }
     const reasons = authenticated.cause.reasons
     if (reasons.length !== 1 || !Cause.isFailReason(reasons[0]!) || !Schema.is(AcpGateway.GatewayError)(reasons[0]!.error)) {
-      yield* Effect.logError("Gateway authentication failed", authenticated.cause)
+      yield* Effect.logError("Gateway authentication failed")
     }
     return Response.empty({ status: 401 })
   }
@@ -72,7 +72,7 @@ export const route = <R>(options: Options<R>) => HttpRouter.route("GET", options
   }
   const reportFailure = (cause: Cause.Cause<unknown>) =>
     cause.reasons.length === 1 && Cause.isFailReason(cause.reasons[0]!) && Schema.is(AcpGateway.GatewayError)(cause.reasons[0]!.error)
-      ? Effect.void : Effect.logError("Gateway request failed", cause)
+      ? Effect.void : Effect.logError("Gateway request failed")
   const protect = <A, E, R2>(effect: Effect.Effect<A, E, R2>) => effect.pipe(Effect.catchCause((cause) =>
     Cause.hasInterruptsOnly(cause)
       ? Effect.failCause(Cause.fromReasons<never>(cause.reasons.filter(Cause.isInterruptReason)))

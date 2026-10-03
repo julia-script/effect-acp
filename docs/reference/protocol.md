@@ -91,3 +91,5 @@ A notification handler that waits for a new outgoing response can also stall und
 A request `timeout` includes send backpressure and response waiting. Timeout before dispatch has a null `requestId`. Interrupting a response wait does not imply remote session cancellation.
 
 `onRequest` and `onNotification` construct schema-backed routes for `handlers(routes, fallback?)`. Raw handlers receive unknown payloads. Returning `undefined` declines a method; unknown requests get Method not found, while unknown notifications are ignored. Expected request failures use `AcpRemoteError`. Defects are converted to generic internal errors without their details.
+
+Request handlers receive `RequestContext.commitResult(effect)` for an irreversible acceptance boundary. Its successful JSON result remains authoritative after later handler failures or request cancellation. Request cancellation waits for an active acceptance boundary to finish; connection shutdown can still interrupt it. Keep cancellable preparation and foreground work outside the boundary. The agent helper uses it to preserve a v2 prompt's inserted message ID.

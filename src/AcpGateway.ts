@@ -209,7 +209,7 @@ export type Operation = typeof Operation.Type
  *
  * @category schemas
  */
-export const AttachmentRequest = Schema.Struct({ epoch: Schema.String, workspace: Schema.String, session: Schema.String, clientId: Schema.String, takeover: Schema.optionalKey(Schema.Boolean), cursor: Schema.optionalKey(Cursor) })
+export const AttachmentRequest = Schema.Struct({ epoch: Schema.String, workspace: Schema.String, session: Schema.String, clientId: Schema.String, takeover: Schema.optionalKey(Schema.Boolean), cursor: Schema.optionalKey(Cursor), expected: Schema.optionalKey(Schema.Struct({ sessionId: Schema.String, version: Schema.Literals([1, 2]) })) })
 /**
  * Session attachment request with optional takeover and a retained event cursor.
  *

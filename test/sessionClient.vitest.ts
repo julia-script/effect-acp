@@ -31,6 +31,18 @@ const withSession = (
     return { ...open, session }
   })
 
+/** Uses the actual initialize advertisement rather than the default harness options. */
+const withElicitationSession = (version: 1 | 2) => Effect.gen(function*() {
+  const agent = yield* scriptedAgent({ version })
+  const client = yield* AcpClient.pipe(Effect.provide(AcpLocalClient.layer.pipe(Layer.provide(agent.connector))))
+  const elicitation = { form: {}, url: {} }
+  const connection = yield* client.connect(version === 1
+    ? { versions: [1], params: { clientInfo: { name: "test", version: "1" }, clientCapabilities: { elicitation } } }
+    : { versions: [2], params: { info: { name: "test", version: "1" }, capabilities: { elicitation } } })
+  const session = yield* connection.newSession({ cwd: "/work" })
+  return { agent, connection, session }
+})
+
 for (const version of [1, 2] as const) {
   it.effect(`v${version} terminal authentication advertises the version's capability shape`, () => run(Effect.gen(function*() {
     const { agent } = yield* harness(version, { connect: { terminalAuth: () => Effect.void } })
@@ -450,7 +462,7 @@ describe("interaction deadlines and withdrawal", () => {
 
   it.effect("an elicitation is exposed as a pending interaction and resolved once", () =>
     run(Effect.gen(function*() {
-      const { agent, session } = yield* withSession(2)
+      const { agent, session } = yield* withElicitationSession(2)
       yield* agent.send({
         jsonrpc: "2.0",
         id: "elicit-1",
@@ -718,7 +730,7 @@ describe("provisional routing bounds", () => {
     for (const kind of ["permission", "elicitation"] as const) {
       it.effect(`v${version} ordinary release answers a pending ${kind} with cancellation`, () =>
         run(Effect.gen(function*() {
-          const { agent, session } = yield* withSession(version)
+          const { agent, session } = yield* (kind === "elicitation" ? withElicitationSession(version) : withSession(version))
           const observed = yield* session.observe
           const id = `release-${kind}`
           yield* agent.send({

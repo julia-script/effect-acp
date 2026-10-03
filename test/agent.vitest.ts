@@ -23,6 +23,9 @@ import * as Stdio from "effect/Stdio"
 import * as Stream from "effect/Stream"
 import * as AcpAgent from "../src/AcpAgent.ts"
 import * as Store from "../src/agent/Store.ts"
+import * as Schema from "effect/Schema"
+import * as V1 from "../src/protocol/v1/Schema.ts"
+import * as V2 from "../src/protocol/v2/Schema.ts"
 import * as InMemory from "../src/transport/InMemory.ts"
 import * as ProcessStdio from "../src/transport/ProcessStdio.ts"
 import { driver } from "./support/driver.ts"
@@ -973,4 +976,353 @@ it.effect("store orders first recordings by time, keeps equal-time insertion ord
   expect(one[0]?.replacement).toEqual([{ type: "text", text: "replaced" }])
   expect(one[0]?.chunks).toEqual([{ type: "text", text: "chunk" }])
   expect(two.map((message) => [message.messageId, DateTime.toEpochMillis(message.recordedAt)])).toEqual([["first", 4_000]])
+})))
+
+const validAgentFrame = (frame: unknown, version: 1 | 2) => {
+  if (field(frame, "method") === "session/update") {
+    expect(Schema.is(version === 1 ? V1.SessionNotification : V2.UpdateSessionNotification)(field(frame, "params"))).toBe(true)
+  }
+}
+const untilFrame = (peer: Effect.Success<ReturnType<typeof connect>>, predicate: (frame: unknown) => boolean) =>
+  Effect.gen(function*() {
+    const frames: Array<unknown> = []
+    while (true) {
+      const frame = yield* peer.next
+      frames.push(frame)
+      if (predicate(frame)) return frames
+    }
+  })
+
+for (const outcome of ["end_turn", "refusal", "error", "typed failure", "defect"] as const) {
+  it.effect(`v2 distinguishes ${outcome} from other completion reasons`, () => run(Effect.gen(function*() {
+    const agent = yield* AcpAgent.make({ ...baseOptions(), prompt: {
+      insert: () => Effect.succeed({ messageId: "accepted" }),
+      execute: () => {
+        if (outcome === "typed failure") return Effect.fail(AcpAgent.authRequired())
+        if (outcome === "defect") return Effect.die(new Error("private execution defect"))
+        return Effect.succeed(outcome)
+      }
+    } })
+    const peer = yield* connect(agent)
+    yield* peer.send(initialize(2)); yield* peer.next
+    yield* peer.send({ jsonrpc: "2.0", id: 1, method: "session/new", params: { cwd: "/work" } }); yield* peer.next
+    yield* peer.send({ jsonrpc: "2.0", id: 2, method: "session/prompt", params: { sessionId: "s-1", prompt: [] } })
+    const frames: Array<unknown> = []
+    while (!frames.some((frame) => field(frame, "id") === 2) || !frames.some((frame) => field(frame, "params.update.state") === "idle")) {
+      frames.push(yield* peer.next)
+    }
+    frames.forEach((frame) => validAgentFrame(frame, 2))
+    expect(frames.find((frame) => field(frame, "id") === 2)).toEqual({ jsonrpc: "2.0", id: 2, result: { messageId: "accepted" } })
+    const idle = frames.find((frame) => field(frame, "params.update.state") === "idle")
+    expect(field(idle, "params.update.stopReason")).toBe(outcome === "typed failure" || outcome === "defect" ? "error" : outcome)
+    if (outcome === "typed failure") expect(field(idle, "params.update.error.code")).toBe(-32000)
+    if (outcome === "defect") {
+      expect(field(idle, "params.update.error.message")).toBe("Internal error")
+      expect(JSON.stringify(idle)).not.toContain("private execution defect")
+    }
+  })))
+}
+
+for (const version of [1, 2] as const) {
+  for (const support of ["absent", "empty", "disabled", "enabled"] as const) {
+    it.effect(`v${version} gates terminal authentication on ${support} peer capability`, () => run(Effect.gen(function*() {
+      const agent = yield* AcpAgent.make({ ...baseOptions(), auth: {
+        methods: [{ methodId: "terminal", name: "Terminal", type: "terminal" }, { methodId: "normal", name: "Agent" }],
+        login: () => Effect.void, logout: () => Effect.void
+      } })
+      const peer = yield* connect(agent)
+      let terminal: boolean | object | null = null
+      if (version === 1) terminal = support === "enabled"
+      else if (support === "enabled") terminal = {}
+      let capability: unknown = {}
+      if (support === "empty") capability = { auth: {} }
+      if (support === "disabled" || support === "enabled") capability = { auth: { terminal } }
+      const params = version === 1
+        ? { protocolVersion: 1, clientCapabilities: capability }
+        : { protocolVersion: 2, info: { name: "client", version: "1" }, capabilities: capability }
+      expect(Schema.is(version === 1 ? V1.InitializeRequest : V2.InitializeRequest)(params)).toBe(true)
+      yield* peer.send({ jsonrpc: "2.0", id: 0, method: "initialize", params })
+      const response = yield* peer.next
+      expect(Schema.is(version === 1 ? V1.InitializeResponse : V2.InitializeResponse)(field(response, "result"))).toBe(true)
+      const methods = field(response, "result.authMethods")
+      expect(methods).toEqual(support === "enabled" ? [
+        expect.objectContaining({ type: "terminal" }), expect.objectContaining({ type: "agent" })
+      ] : [expect.objectContaining({ type: "agent" })])
+    })))
+  }
+}
+
+for (const customClose of [false, true]) {
+  it.effect(`v2 close drains cancellation before freeing a session (close handler ${customClose})`, () => run(Effect.gen(function*() {
+    const started = yield* Deferred.make<void>()
+    const lifecycle: Array<string> = []
+    const agent = yield* AcpAgent.make({ ...baseOptions(), session: {
+      create: () => Effect.succeed({ sessionId: "s-1" }),
+      cancel: () => Effect.sync(() => { lifecycle.push("cancel") }),
+      ...(customClose ? { close: () => Effect.sync(() => { lifecycle.push("close") }) } : {})
+    }, prompt: {
+      insert: () => Effect.succeed({ messageId: "accepted" }),
+      execute: ({ emit }) => Deferred.succeed(started, undefined).pipe(Effect.andThen(Effect.never),
+        Effect.ensuring(Effect.ignore(emit.agentChunk("final", { type: "text", text: "final output" })).pipe(
+          Effect.andThen(Effect.sync(() => { lifecycle.push("finalized") })))))
+    } })
+    const peer = yield* connect(agent)
+    yield* peer.send(initialize(2)); yield* peer.next
+    yield* peer.send({ jsonrpc: "2.0", id: 1, method: "session/new", params: { cwd: "/work" } }); yield* peer.next
+    yield* peer.send({ jsonrpc: "2.0", id: 2, method: "session/prompt", params: { sessionId: "s-1", prompt: [] } })
+    yield* Deferred.await(started)
+    yield* untilFrame(peer, (frame) => field(frame, "id") === 2)
+    yield* peer.send({ jsonrpc: "2.0", id: 3, method: "session/close", params: { sessionId: "s-1" } })
+    const frames = yield* untilFrame(peer, (frame) => field(frame, "id") === 3)
+    frames.forEach((frame) => validAgentFrame(frame, 2))
+    const final = frames.findIndex((frame) => field(frame, "params.update.content.text") === "final output")
+    const idle = frames.findIndex((frame) => field(frame, "params.update.stopReason") === "cancelled")
+    expect(final).toBeGreaterThanOrEqual(0)
+    expect(idle).toBeGreaterThan(final)
+    expect(idle).toBeLessThan(frames.length - 1)
+    expect(lifecycle).toEqual(customClose ? ["finalized", "cancel", "close"] : ["finalized", "cancel"])
+    expect(frames.at(-1)).toEqual({ jsonrpc: "2.0", id: 3, result: {} })
+  })))
+}
+
+for (const failure of ["typed", "defect"] as const) {
+  it.effect(`v2 retention ${failure} failure preserves insertion acknowledgement and stops execution`, () => run(Effect.gen(function*() {
+    const backing = yield* Store.Store
+    const retained = Store.Store.of({ ...backing, retain: () => failure === "typed"
+      ? Effect.fail(new Store.StoreError({ kind: "Corrupt", message: "storage unavailable" })) : Effect.die("storage defect") })
+    const conversation: Array<string> = []
+    let executions = 0
+    const agent = yield* AcpAgent.make({ ...baseOptions(), prompt: {
+      insert: () => Effect.sync(() => { conversation.push("accepted"); return { messageId: "accepted" } }),
+      execute: () => Effect.sync(() => { executions++; return "end_turn" as const })
+    } })
+    const peer = yield* connect(agent).pipe(Effect.provideService(Store.Store, retained))
+    yield* peer.send(initialize(2)); yield* peer.next
+    yield* peer.send({ jsonrpc: "2.0", id: 1, method: "session/new", params: { cwd: "/work" } }); yield* peer.next
+    yield* peer.send({ jsonrpc: "2.0", id: 2, method: "session/prompt", params: { sessionId: "s-1", prompt: [{ type: "text", text: "input" }] } })
+    const frames: Array<unknown> = []
+    while (!frames.some((frame) => field(frame, "id") === 2) || !frames.some((frame) => field(frame, "params.update.state") === "idle")) frames.push(yield* peer.next)
+    frames.forEach((frame) => validAgentFrame(frame, 2))
+    expect(frames.find((frame) => field(frame, "id") === 2)).toEqual({ jsonrpc: "2.0", id: 2, result: { messageId: "accepted" } })
+    expect(field(frames.find((frame) => field(frame, "params.update.state") === "idle"), "params.update.stopReason")).toBe("error")
+    expect(conversation).toEqual(["accepted"])
+    expect(executions).toBe(0)
+  })))
+}
+
+for (const cancellation of ["session", "request", "close"] as const) {
+  it.effect(`v2 ${cancellation} cancellation after insertion preserves ack and owns foreground correctly`, () => run(Effect.gen(function*() {
+    const entered = yield* Deferred.make<void>()
+    const release = yield* Deferred.make<void>()
+    const backing = yield* Store.Store
+    let interrupted = false
+    let executions = 0
+    const retained = Store.Store.of({ ...backing, retain: (message) => Deferred.succeed(entered, undefined).pipe(
+      Effect.andThen(Deferred.await(release)), Effect.andThen(backing.retain(message)),
+      Effect.onInterrupt(() => Effect.sync(() => { interrupted = true }))) })
+    const agent = yield* AcpAgent.make({ ...baseOptions(), prompt: {
+      insert: () => Effect.succeed({ messageId: "accepted" }),
+      execute: () => Effect.sync(() => { executions++; return "end_turn" as const })
+    } })
+    const peer = yield* connect(agent).pipe(Effect.provideService(Store.Store, retained))
+    yield* peer.send(initialize(2)); yield* peer.next
+    yield* peer.send({ jsonrpc: "2.0", id: 1, method: "session/new", params: { cwd: "/work" } }); yield* peer.next
+    yield* peer.send({ jsonrpc: "2.0", id: 2, method: "session/prompt", params: { sessionId: "s-1", prompt: [] } })
+    yield* Deferred.await(entered)
+    const before = yield* untilFrame(peer, (frame) => field(frame, "id") === 2)
+    expect(before.find((frame) => field(frame, "id") === 2)).toEqual({ jsonrpc: "2.0", id: 2, result: { messageId: "accepted" } })
+    let cancellationFrame: unknown
+    if (cancellation === "session") cancellationFrame = { jsonrpc: "2.0", method: "session/cancel", params: { sessionId: "s-1" } }
+    else if (cancellation === "close") cancellationFrame = { jsonrpc: "2.0", id: 4, method: "session/close", params: { sessionId: "s-1" } }
+    else cancellationFrame = { jsonrpc: "2.0", method: "$/cancel_request", params: { requestId: 2 } }
+    yield* peer.send(cancellationFrame)
+    if (cancellation === "request") yield* Deferred.succeed(release, undefined)
+    const after = yield* untilFrame(peer, (frame) => field(frame, "params.update.state") === "idle")
+    expect(field(after.at(-1), "params.update.stopReason")).toBe(cancellation === "request" ? "end_turn" : "cancelled")
+    expect(interrupted).toBe(cancellation !== "request")
+    expect(executions).toBe(cancellation === "request" ? 1 : 0)
+    if (cancellation === "close") {
+      const closed = yield* untilFrame(peer, (frame) => field(frame, "id") === 4)
+      expect(closed.at(-1)).toEqual({ jsonrpc: "2.0", id: 4, result: {} })
+    }
+    yield* peer.send({ jsonrpc: "2.0", id: 3, method: "session/list", params: {} })
+    const barrier = yield* untilFrame(peer, (frame) => field(frame, "id") === 3)
+    expect([...before, ...after, ...barrier].filter((frame) => field(frame, "id") === 2)).toHaveLength(1)
+  })))
+}
+
+it.effect("v2 insertion rejection remains an RPC error without starting foreground work", () => run(Effect.gen(function*() {
+  let executions = 0
+  const agent = yield* AcpAgent.make({ ...baseOptions(), prompt: {
+    insert: () => Effect.fail(AcpAgent.authRequired()),
+    execute: () => Effect.sync(() => { executions++; return "end_turn" as const })
+  } })
+  const peer = yield* connect(agent)
+  yield* peer.send(initialize(2)); yield* peer.next
+  yield* peer.send({ jsonrpc: "2.0", id: 1, method: "session/new", params: { cwd: "/work" } }); yield* peer.next
+  yield* peer.send({ jsonrpc: "2.0", id: 2, method: "session/prompt", params: { sessionId: "s-1", prompt: [] } })
+  expect(yield* peer.next).toEqual({ jsonrpc: "2.0", id: 2, error: { code: -32000, message: "Authentication required" } })
+  expect(executions).toBe(0)
+})))
+
+for (const insertion of ["interruptible", "committing"] as const) {
+  it.effect(`v2 request cancellation during ${insertion} insertion respects the acceptance boundary`, () => run(Effect.gen(function*() {
+    const entered = yield* Deferred.make<void>()
+    const release = yield* Deferred.make<void>()
+    const conversation: Array<string> = []
+    let executions = 0
+    const insert = Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release)),
+      Effect.andThen(Effect.sync(() => { conversation.push("accepted"); return { messageId: "accepted" } })))
+    const agent = yield* AcpAgent.make({ ...baseOptions(), prompt: {
+      insert: () => insertion === "committing" ? Effect.uninterruptible(insert) : insert,
+      execute: () => Effect.sync(() => { executions++; return "end_turn" as const })
+    } })
+    const peer = yield* connect(agent)
+    yield* peer.send(initialize(2)); yield* peer.next
+    yield* peer.send({ jsonrpc: "2.0", id: 1, method: "session/new", params: { cwd: "/work" } }); yield* peer.next
+    yield* peer.send({ jsonrpc: "2.0", id: 2, method: "session/prompt", params: { sessionId: "s-1", prompt: [] } })
+    yield* Deferred.await(entered)
+    yield* peer.send({ jsonrpc: "2.0", method: "$/cancel_request", params: { requestId: 2 } })
+    // A request on the same reader proves cancellation was received before
+    // the author's uninterruptible conversation transaction is released.
+    yield* peer.send({ jsonrpc: "2.0", id: 3, method: "session/list", params: {} })
+    const frames = yield* untilFrame(peer, (frame) => field(frame, "id") === 3)
+    yield* Deferred.succeed(release, undefined)
+    while (!frames.some((frame) => field(frame, "id") === 2)) frames.push(yield* peer.next)
+    const response = frames.find((frame) => field(frame, "id") === 2)
+    expect(response).toEqual({ jsonrpc: "2.0", id: 2, result: { messageId: "accepted" } })
+    expect(conversation).toEqual(["accepted"])
+    while (!frames.some((frame) => field(frame, "params.update.state") === "idle")) frames.push(yield* peer.next)
+    expect(executions).toBe(1)
+    expect(field(frames.find((frame) => field(frame, "params.update.state") === "idle"), "params.update.stopReason")).toBe("end_turn")
+  })))
+}
+
+it.effect("v2 close joins cancellation already draining finalizers", () => run(Effect.gen(function*() {
+  const started = yield* Deferred.make<void>()
+  const finalizing = yield* Deferred.make<void>()
+  const release = yield* Deferred.make<void>()
+  let cancels = 0
+  const agent = yield* AcpAgent.make({ ...baseOptions(), session: {
+    create: () => Effect.succeed({ sessionId: "s-1" }), cancel: () => Effect.sync(() => { cancels++ })
+  }, prompt: {
+    insert: () => Effect.succeed({ messageId: "accepted" }),
+    execute: ({ emit }) => Deferred.succeed(started, undefined).pipe(Effect.andThen(Effect.never),
+      Effect.ensuring(Deferred.succeed(finalizing, undefined).pipe(Effect.andThen(Deferred.await(release)),
+        Effect.andThen(Effect.ignore(emit.agentChunk("final", { type: "text", text: "final output" }))))))
+  } })
+  const peer = yield* connect(agent)
+  yield* peer.send(initialize(2)); yield* peer.next
+  yield* peer.send({ jsonrpc: "2.0", id: 1, method: "session/new", params: { cwd: "/work" } }); yield* peer.next
+  yield* peer.send({ jsonrpc: "2.0", id: 2, method: "session/prompt", params: { sessionId: "s-1", prompt: [] } })
+  yield* Deferred.await(started)
+  yield* untilFrame(peer, (frame) => field(frame, "id") === 2)
+  yield* peer.send({ jsonrpc: "2.0", method: "session/cancel", params: { sessionId: "s-1" } })
+  yield* Deferred.await(finalizing)
+  yield* peer.send({ jsonrpc: "2.0", id: 3, method: "session/close", params: { sessionId: "s-1" } })
+  yield* peer.send({ jsonrpc: "2.0", id: 4, method: "session/list", params: {} })
+  yield* untilFrame(peer, (frame) => field(frame, "id") === 4)
+  yield* Deferred.succeed(release, undefined)
+  const frames = yield* untilFrame(peer, (frame) => field(frame, "id") === 3)
+  expect(cancels).toBe(1)
+  expect(frames.filter((frame) => field(frame, "params.update.state") === "idle")).toHaveLength(1)
+  const final = frames.findIndex((frame) => field(frame, "params.update.content.text") === "final output")
+  expect(final).toBeGreaterThanOrEqual(0)
+  expect(frames.findIndex((frame) => field(frame, "params.update.stopReason") === "cancelled")).toBeGreaterThan(final)
+  expect(frames.at(-1)).toEqual({ jsonrpc: "2.0", id: 3, result: {} })
+})))
+
+it.effect("v2 close reports an interruption-time finalizer failure as error", () => run(Effect.gen(function*() {
+  const started = yield* Deferred.make<void>()
+  const agent = yield* AcpAgent.make({ ...baseOptions(), prompt: {
+    insert: () => Effect.succeed({ messageId: "accepted" }),
+    execute: () => Deferred.succeed(started, undefined).pipe(Effect.andThen(Effect.never),
+      Effect.onInterrupt(() => Effect.die("private finalizer failure")))
+  } })
+  const peer = yield* connect(agent)
+  yield* peer.send(initialize(2)); yield* peer.next
+  yield* peer.send({ jsonrpc: "2.0", id: 1, method: "session/new", params: { cwd: "/work" } }); yield* peer.next
+  yield* peer.send({ jsonrpc: "2.0", id: 2, method: "session/prompt", params: { sessionId: "s-1", prompt: [] } })
+  yield* Deferred.await(started)
+  yield* untilFrame(peer, (frame) => field(frame, "id") === 2)
+  yield* peer.send({ jsonrpc: "2.0", id: 3, method: "session/close", params: { sessionId: "s-1" } })
+  const frames = yield* untilFrame(peer, (frame) => field(frame, "id") === 3)
+  const idles = frames.filter((frame) => field(frame, "params.update.state") === "idle")
+  expect(idles).toHaveLength(1)
+  expect(field(idles[0], "params.update.stopReason")).toBe("error")
+  expect(field(idles[0], "params.update.error.message")).toBe("Internal error")
+  expect(JSON.stringify(idles)).not.toContain("private finalizer failure")
+  expect(frames.at(-1)).toEqual({ jsonrpc: "2.0", id: 3, result: {} })
+})))
+
+it.effect("v2 commits only the validated canonical insertion identity", () => run(Effect.gen(function*() {
+  const agent = yield* AcpAgent.make({ ...baseOptions(), prompt: {
+    insert: () => Effect.succeed({ messageId: "accepted", privateState: "author-only" }),
+    execute: () => Effect.succeed("end_turn")
+  } })
+  const peer = yield* connect(agent)
+  yield* peer.send(initialize(2)); yield* peer.next
+  yield* peer.send({ jsonrpc: "2.0", id: 1, method: "session/new", params: { cwd: "/work" } }); yield* peer.next
+  yield* peer.send({ jsonrpc: "2.0", id: 2, method: "session/prompt", params: { sessionId: "s-1", prompt: [] } })
+  const frames = yield* untilFrame(peer, (frame) => field(frame, "id") === 2)
+  expect(frames.at(-1)).toEqual({ jsonrpc: "2.0", id: 2, result: { messageId: "accepted" } })
+})))
+
+it.effect("cancelling the v2 close RPC still drains the started session cancellation", () => run(Effect.gen(function*() {
+  const started = yield* Deferred.make<void>()
+  const finalizing = yield* Deferred.make<void>()
+  const release = yield* Deferred.make<void>()
+  let inserts = 0
+  const agent = yield* AcpAgent.make({ ...baseOptions(), prompt: {
+    insert: () => Effect.sync(() => ({ messageId: `accepted-${++inserts}` })),
+    execute: ({ emit }) => Deferred.succeed(started, undefined).pipe(Effect.andThen(Effect.never),
+      Effect.ensuring(Deferred.succeed(finalizing, undefined).pipe(Effect.andThen(Deferred.await(release)),
+        Effect.andThen(Effect.ignore(emit.agentChunk("final", { type: "text", text: "final output" }))))))
+  } })
+  const peer = yield* connect(agent)
+  yield* peer.send(initialize(2)); yield* peer.next
+  yield* peer.send({ jsonrpc: "2.0", id: 1, method: "session/new", params: { cwd: "/work" } }); yield* peer.next
+  yield* peer.send({ jsonrpc: "2.0", id: 2, method: "session/prompt", params: { sessionId: "s-1", prompt: [] } })
+  yield* Deferred.await(started)
+  yield* untilFrame(peer, (frame) => field(frame, "id") === 2)
+  yield* peer.send({ jsonrpc: "2.0", id: 3, method: "session/close", params: { sessionId: "s-1" } })
+  yield* Deferred.await(finalizing)
+  yield* peer.send({ jsonrpc: "2.0", method: "$/cancel_request", params: { requestId: 3 } })
+  yield* peer.send({ jsonrpc: "2.0", id: 4, method: "session/prompt", params: { sessionId: "s-1", prompt: [] } })
+  const during = yield* untilFrame(peer, (frame) => field(frame, "id") === 4)
+  expect(field(during.at(-1), "error.message")).toBe("Session is busy")
+  expect(inserts).toBe(1)
+  yield* Deferred.succeed(release, undefined)
+  const frames = [...during]
+  while (!frames.some((frame) => field(frame, "id") === 3) || !frames.some((frame) => field(frame, "params.update.state") === "idle")) frames.push(yield* peer.next)
+  const final = frames.findIndex((frame) => field(frame, "params.update.content.text") === "final output")
+  expect(final).toBeGreaterThanOrEqual(0)
+  expect(frames.findIndex((frame) => field(frame, "params.update.stopReason") === "cancelled")).toBeGreaterThan(final)
+  expect(field(frames.find((frame) => field(frame, "id") === 3), "error.code")).toBe(-32800)
+})))
+
+it.effect("disconnecting the owning peer interrupts a blocked acceptance phase", () => run(Effect.gen(function*() {
+  const entered = yield* Deferred.make<void>()
+  const interrupted = yield* Deferred.make<void>()
+  let executions = 0
+  const agent = yield* AcpAgent.make({ ...baseOptions(), prompt: {
+    insert: () => Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never),
+      Effect.onInterrupt(() => Effect.asVoid(Deferred.succeed(interrupted, undefined)))),
+    execute: () => Effect.sync(() => { executions++; return "end_turn" as const })
+  } })
+  const parent = yield* Scope.Scope
+  const clientScope = yield* Scope.fork(parent)
+  const pair = yield* InMemory.make()
+  const client = yield* Scope.provide(pair.left, clientScope)
+  const server = yield* pair.right
+  const serving = yield* Effect.forkScoped(agent.serve.pipe(Effect.provideService(AcpTransport, server)))
+  const peer = yield* driver(client)
+  yield* peer.send(initialize(2)); yield* peer.next
+  yield* peer.send({ jsonrpc: "2.0", id: 1, method: "session/new", params: { cwd: "/work" } }); yield* peer.next
+  yield* peer.send({ jsonrpc: "2.0", id: 2, method: "session/prompt", params: { sessionId: "s-1", prompt: [] } })
+  yield* Deferred.await(entered)
+  yield* Scope.close(clientScope, Exit.void)
+  yield* Deferred.await(interrupted)
+  expect(Exit.isSuccess(yield* Fiber.await(serving))).toBe(true)
+  expect(executions).toBe(0)
 })))

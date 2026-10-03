@@ -14,27 +14,37 @@ import { AcpConnector, AcpError, AcpProtocol, AcpTransport } from "effect-acp"
 import { createAgent } from "../test/fixtures/agent.ts"
 
 /** Adapts a MessagePort. The port is closed when the connection's scope closes. */
-const fromMessagePort = (port: MessagePort) =>
+export const fromMessagePort = (port: MessagePort) =>
   Effect.gen(function*() {
-    // Bounded: if the application stops reading, the channel's own buffering applies.
+    // MessagePort callbacks cannot backpressure their sender. Overflow is terminal.
     const inbox = yield* Queue.bounded<string, AcpError.AcpTransportError>(256)
+    let closed = false
+    const fail = (error: AcpError.AcpTransportError) => {
+      if (closed) return
+      closed = true
+      port.onmessage = null
+      Queue.failCauseUnsafe(inbox, Cause.fail(error))
+      port.close()
+    }
     port.onmessage = (event) => {
-      if (typeof event.data === "string") Queue.offerUnsafe(inbox, event.data)
-      else {
-        Queue.failCauseUnsafe(
-          inbox,
-          Cause.fail(new AcpError.AcpTransportError({ reason: "InvalidFrame", message: "non-text frame" }))
-        )
+      if (closed) return
+      if (typeof event.data !== "string") {
+        fail(new AcpError.AcpTransportError({ reason: "InvalidFrame", message: "non-text frame" }))
+      } else if (!Queue.offerUnsafe(inbox, event.data)) {
+        fail(new AcpError.AcpTransportError({ reason: "Read", message: "MessagePort inbound capacity exceeded" }))
       }
     }
-    yield* Effect.addFinalizer(() => Effect.sync(() => port.close()))
+    yield* Effect.addFinalizer(() => Effect.sync(() => fail(
+      new AcpError.AcpTransportError({ reason: "Closed", message: "MessagePort transport is closed" })
+    )))
     const transport: AcpTransport.Transport = {
       incoming: Stream.fromQueue(inbox),
-      send: (frame) =>
-        Effect.try({
+      send: (frame) => Effect.suspend(() => closed
+        ? Effect.fail(new AcpError.AcpTransportError({ reason: "Closed", message: "MessagePort transport is closed" }))
+        : Effect.try({
           try: () => port.postMessage(frame),
           catch: (cause) => new AcpError.AcpTransportError({ reason: "Write", message: "postMessage failed", cause })
-        })
+        }))
     }
     return transport
   })

@@ -31,7 +31,7 @@ export class AcpConnectionClosed extends Schema.TaggedError<AcpConnectionClosed>
  * @category errors
  */
 export class AcpRemoteError extends Schema.TaggedError<AcpRemoteError>()("AcpRemoteError", {
-  code: Schema.Finite,
+  code: Schema.Int,
   message: Schema.String,
   data: Schema.optional(Schema.Unknown)
 }, { identifier: "effect-acp/AcpError/AcpRemoteError" }) {}

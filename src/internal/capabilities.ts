@@ -166,6 +166,14 @@ export const normalize = (
     ? v2Capabilities(negotiated.response, installed)
     : v1Capabilities(negotiated.response, installed)
 
+/** Whether the actual client initialization advertised this elicitation mode. */
+export const elicitationSupported = (negotiated: AcpProtocol.Negotiated, mode: string): boolean => {
+  const capabilities = negotiated.advertised.version === 1
+    ? negotiated.advertised.params.clientCapabilities
+    : negotiated.advertised.params.capabilities
+  return present(capabilities?.elicitation, mode)
+}
+
 /** Whether the negotiated peer accepts the given MCP server configuration. */
 export const mcpServerSupported = (capabilities: Capabilities, server: McpServer): boolean => {
   // v1 stdio servers are identified structurally (command/args), v2 by `type`.

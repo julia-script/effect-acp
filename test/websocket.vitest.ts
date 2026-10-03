@@ -82,9 +82,124 @@ const scriptable = (protocol: string = WebSocket.profile) => {
 
 const socketFrom = (ws: ReturnType<typeof scriptable>) => Socket.fromWebSocket(Effect.succeed(ws), {})
 
+const browserScriptable = (protocol: string = WebSocket.profile) => {
+  const ws = scriptable(protocol)
+  const close = ws.close.bind(ws)
+  const attempted: Array<number | undefined> = []
+  ws.close = (code, reason) => {
+    attempted.push(code)
+    if (code !== undefined && code !== 1000 && (code < 3000 || code > 4999)) {
+      throw new DOMException("Invalid browser close code", "InvalidAccessError")
+    }
+    close(code, reason)
+  }
+  return { ws, attempted }
+}
+
 const collect = <E>(stream: Stream.Stream<string, E>) => Stream.runCollect(stream)
 
 describe("WebSocket profile", () => {
+  for (const problem of ["overflow", "binary", "oversized"] as const) {
+    it.effect(`dialed browser ${problem} falls back to a permitted close code without losing its typed error`, () =>
+      Effect.scoped(Effect.gen(function*() {
+        const { ws, attempted } = browserScriptable()
+        const transport = yield* WebSocket.make("ws://example.test", { buffer: 1, maxFrameBytes: 2 }).pipe(
+          Effect.provideService(Socket.WebSocketConstructor, () => ws)
+        )
+        if (problem === "overflow") ws.message("{}")
+        const inputs = { binary: Uint8Array.of(1), oversized: "123", overflow: "{}" }
+        const reasons = { binary: "InvalidFrame", oversized: "FrameTooLarge", overflow: "Read" }
+        expect(() => ws.message(inputs[problem])).not.toThrow()
+        expect(attempted).toEqual([problem === "binary" ? WebSocket.unsupportedDataClose : WebSocket.tooLargeClose, 1000])
+        expect(ws.readyState).toBe(3)
+        expect(error(yield* Effect.exit(collect(transport.incoming)))).toMatchObject({
+          reason: reasons[problem]
+        })
+        expect(yield* failure(transport.send("{}"))).toMatchObject({ reason: "Closed" })
+      })))
+  }
+
+  it.effect("dialed browser subprotocol rejection closes with a permitted code and remains an Open error", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const { ws, attempted } = browserScriptable("other")
+      expect(yield* failure(WebSocket.make("ws://example.test").pipe(
+        Effect.provideService(Socket.WebSocketConstructor, () => ws)
+      ))).toMatchObject({ reason: "Open" })
+      expect(attempted).toEqual([1002, 1000])
+      expect(ws.readyState).toBe(3)
+    })))
+
+  it.effect("underlying close failures preserve the terminal transport error and scope cleanup", () =>
+    Effect.gen(function*() {
+      const scope = yield* Scope.make()
+      const ws = scriptable()
+      ws.close = () => { throw new Error("underlying close failed") }
+      const transport = yield* WebSocket.make("ws://example.test", { buffer: 1 }).pipe(
+        Effect.provideService(Socket.WebSocketConstructor, () => ws), Scope.provide(scope)
+      )
+      ws.message("{}")
+      expect(() => ws.message("{}")).not.toThrow()
+      expect(error(yield* Effect.exit(collect(transport.incoming)))).toMatchObject({ reason: "Read" })
+      expect(yield* Effect.exit(Scope.close(scope, Exit.void))).toEqual(Exit.void)
+    }))
+
+  it.effect("dialed browser sockets fail at a finite frame bound without a consumer", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const ws = scriptable()
+      const transport = yield* WebSocket.make("ws://example.test", { buffer: 2, maxFrameBytes: 64 }).pipe(
+        Effect.provideService(Socket.WebSocketConstructor, () => ws)
+      )
+      const frame = JSON.stringify({ jsonrpc: "2.0", method: "_ping", params: {} })
+      for (let n = 0; n < 4096; n++) ws.message(frame)
+      expect(ws.closeInfo?.code).toBe(WebSocket.tooLargeClose)
+      expect(error(yield* Effect.exit(collect(transport.incoming)))).toMatchObject({ reason: "Read" })
+      expect(yield* failure(transport.send("{}"))).toMatchObject({ reason: "Closed" })
+    })))
+
+  it.effect("dialed sockets bound bytes independently of the frame count", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const ws = scriptable()
+      const transport = yield* WebSocket.make("ws://example.test", { buffer: 64, highWaterMark: 8 }).pipe(
+        Effect.provideService(Socket.WebSocketConstructor, () => ws)
+      )
+      ws.message("12345678")
+      expect(ws.closeInfo).toBeUndefined()
+      ws.message("9")
+      expect(ws.closeInfo?.code).toBe(WebSocket.tooLargeClose)
+      expect(error(yield* Effect.exit(collect(transport.incoming)))).toMatchObject({ reason: "Read" })
+    })))
+
+  it.effect("dialed sockets drain in order and pause native producers at capacity", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const ws = scriptable()
+      let pauses = 0
+      let resumes = 0
+      const native = Object.assign(ws, { pause: () => { pauses++ }, resume: () => { resumes++ } })
+      const transport = yield* WebSocket.make("ws://example.test", { buffer: 2, highWaterMark: 8 }).pipe(
+        Effect.provideService(Socket.WebSocketConstructor, () => native)
+      )
+      ws.message("one")
+      ws.message("two")
+      expect(pauses).toBe(1)
+      expect(yield* collect(Stream.take(transport.incoming, 2))).toEqual(["one", "two"])
+      expect(resumes).toBe(1)
+      ws.message("new")
+      expect(yield* collect(Stream.take(transport.incoming, 1))).toEqual(["new"])
+      yield* transport.send("out")
+      expect(ws.sent).toEqual(["out"])
+      ws.remoteClose(1000)
+      expect(yield* collect(transport.incoming)).toEqual([])
+    })))
+
+  it.effect("invalid receive limits fail before constructing a socket", () =>
+    Effect.scoped(Effect.gen(function*() {
+      let constructed = false
+      const received = yield* failure(WebSocket.make("ws://example.test", { highWaterMark: Infinity }).pipe(
+        Effect.provideService(Socket.WebSocketConstructor, () => { constructed = true; return scriptable() })
+      ))
+      expect(received).toMatchObject({ reason: "Open" })
+      expect(constructed).toBe(false)
+    })))
   it.effect("carries one complete JSON text frame per message in both directions", () =>
     Effect.scoped(Effect.gen(function*() {
       const ws = scriptable()

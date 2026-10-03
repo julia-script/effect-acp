@@ -114,9 +114,14 @@ export type HandlerError = AcpAgentError | StoreError
 /**
  * Terminal state of a foreground turn.
  *
+ * **Details**
+ *
+ * V2 reports failed work as `error`; deliberate refusal remains `refusal`. V1
+ * has no error stop reason, so the authoring helper maps `error` to `refusal`.
+ *
  * @category models
  */
-export type StopReason = "end_turn" | "max_tokens" | "max_turn_requests" | "refusal" | "cancelled"
+export type StopReason = "end_turn" | "max_tokens" | "max_turn_requests" | "refusal" | "cancelled" | "error"
 
 /**
  * Version-aware update emission for one session.
@@ -327,8 +332,9 @@ export interface SessionHandlers<R = never> {
  */
 export interface PromptHandlers<R = never> {
   /**
-   * Records the user message and returns its canonical id. On v2 its success — and only its success
-   * — produces the `session/prompt` response.
+   * Records the user message and returns its canonical id. On v2 its successful insertion
+   * produces the `session/prompt` acknowledgement even if retention or foreground work later
+   * fails. Request cancellation after insertion does not replace this acknowledgement.
    */
   readonly insert: (request: InsertRequest) => Effect.Effect<{ readonly messageId: string }, HandlerError, R>
   /**
@@ -346,7 +352,8 @@ export interface PromptHandlers<R = never> {
  */
 export interface AuthHandlers<R = never> {
   /**
-   * Authentication methods advertised during initialize.
+   * Authentication methods advertised during initialize. Terminal methods are included only
+   * when the client advertises terminal authentication support.
    */
   readonly methods: ReadonlyArray<{
     readonly methodId: string
@@ -451,8 +458,8 @@ export interface AcpAgent<R = never> {
  * Only surfaces with an installed handler are advertised, so the wire never
  * promises more than construction validated.
  */
-const advertisement = <R>(options: Options<R>, version: Version): V1.InitializeResponse | V2.InitializeResponse => {
-  const methods = options.auth?.methods ?? []
+const advertisement = <R>(options: Options<R>, version: Version, terminalAuth: boolean): V1.InitializeResponse | V2.InitializeResponse => {
+  const methods = (options.auth?.methods ?? []).filter((method) => method.type !== "terminal" || terminalAuth)
   if (version === 1) {
     return {
       protocolVersion: 1,
@@ -508,6 +515,8 @@ interface SessionState {
   /** Scope owning this session's foreground execution. */
   readonly scope: Scope.Closeable
   inserting?: boolean
+  closing?: boolean
+  cancellation?: Deferred.Deferred<void, HandlerError> | undefined
   running: Fiber.Fiber<StopReason, HandlerError> | undefined
   cancelled: boolean
   cancelling: boolean
@@ -661,8 +670,10 @@ const build = <R>(options: Options<R>): AcpAgent<R> => {
       }
 
       /** v2 reports turn completion as an idle state update; v1 in its response. */
-      const emitIdle = (sessionId: string, version: Version, stopReason: StopReason) =>
-        version === 2 ? notify(sessionId, { sessionUpdate: "state_update", state: "idle", stopReason }) : Effect.void
+      const emitIdle = (sessionId: string, version: Version, stopReason: StopReason, error?: AcpRemoteError) =>
+        version === 2 ? notify(sessionId, { sessionUpdate: "state_update", state: "idle", stopReason,
+          ...(error ? { error: { code: error.code, message: error.message, ...(error.data === undefined ? {} : { data: error.data }) } } : {})
+        }) : Effect.void
 
       const emitRunning = (sessionId: string, version: Version) =>
         version === 2 ? notify(sessionId, { sessionUpdate: "state_update", state: "running" }) : Effect.void
@@ -759,7 +770,10 @@ const build = <R>(options: Options<R>): AcpAgent<R> => {
           elicitation: elicitation ? (["form", "url"] as const).filter((mode) => elicitation[mode] != null) : [],
           raw: wire
         }
-        return advertisement(options, version)
+        const terminalAuth = raw.protocolVersion === 1
+          ? (wire as V1.InitializeRequest).clientCapabilities?.auth?.terminal === true
+          : (wire as V2.InitializeRequest).capabilities?.auth?.terminal != null
+        return advertisement(options, version, terminalAuth)
       })
 
       const newSession = (params: unknown) =>
@@ -781,30 +795,34 @@ const build = <R>(options: Options<R>): AcpAgent<R> => {
         })
 
       /** Owns one turn's foreground work; used by both versions. */
-      const execute = (context: SessionContext, prompt: Prompt, messageId: string) =>
+      const execute = (context: SessionContext, prompt: Prompt, messageId: string, before: Effect.Effect<void, HandlerError> = Effect.void) =>
         Effect.gen(function*() {
           const emit = emitFor(context.sessionId, context.version)
           const client = interactionsFor(context.sessionId, context.version, context.peer)
           yield* emitRunning(context.sessionId, context.version)
-          // A failed turn still ends: report it as a refusal rather than
-          // leaving the session running forever. Interruption (cancellation)
-          // passes through, so its own completion signal is emitted instead.
-          const stopReason = yield* options.prompt.execute({ ...context, prompt, messageId, emit, client }).pipe(
+          // V2 distinguishes execution failure from deliberate refusal. V1
+          // keeps its existing refusal completion because it has no error stop reason.
+          let failure: AcpRemoteError | undefined
+          const stopReason = yield* before.pipe(
+            Effect.andThen(Effect.suspend(() => options.prompt.execute({ ...context, prompt, messageId, emit, client }))),
             Effect.catchCause((cause) => {
               if (Cause.hasInterruptsOnly(cause)) return Effect.failCause(cause)
               if (Cause.hasInterrupts(cause)) {
                 // V1's request boundary logs this failure; V2 has already replied.
                 return context.version === 1 ? Effect.failCause(cause) : Effect.andThen(Effect.logError("Agent execution failed", cause), Effect.failCause(cause))
               }
-              return Effect.andThen(Effect.logError("Agent execution failed", cause), Effect.succeed<StopReason>("refusal"))
+              const reason = cause.reasons.length === 1 ? cause.reasons[0] : undefined
+              failure = toRemote(reason && Cause.isFailReason(reason) ? reason.error : undefined)
+              return Effect.andThen(Effect.logError("Agent execution failed", cause), Effect.succeed<StopReason>(context.version === 2 ? "error" : "refusal"))
             })
           )
           // Final updates precede the idle signal.
-          yield* emitIdle(context.sessionId, context.version, stopReason)
-          return stopReason
+          const compatibleReason = context.version === 1 && stopReason === "error" ? "refusal" : stopReason
+          yield* emitIdle(context.sessionId, context.version, compatibleReason, failure)
+          return compatibleReason
         })
 
-      const prompt = (params: unknown) =>
+      const prompt = (params: unknown, requestContext: AcpConnection.RequestContext) =>
         Effect.gen(function*() {
           const current = yield* requirePeer
           const request = yield* decodeInput(PromptInput, params)
@@ -816,42 +834,58 @@ const build = <R>(options: Options<R>): AcpAgent<R> => {
           }
           const state: SessionState = sessions.get(request.sessionId) ?? { scope: yield* Scope.fork(serveScope), running: undefined, cancelled: false, cancelling: false }
           sessions.set(request.sessionId, state)
-          if (state.running || state.inserting || state.cancelling) return yield* new AcpRemoteError({ code: ErrorCode.InvalidRequest, message: "Session is busy" })
+          if (state.running || state.inserting || state.cancelling || state.closing) return yield* new AcpRemoteError({ code: ErrorCode.InvalidRequest, message: "Session is busy" })
           state.inserting = true
           state.cancelled = false
-          const inserted = yield* handler(Effect.suspend(() => options.prompt.insert({ ...context, prompt: request.prompt }))).pipe(Effect.onExit((exit) => Exit.isFailure(exit) ? Effect.sync(() => { state.inserting = false }) : Effect.void))
-          const { fiber, completed } = yield* Effect.uninterruptible(Effect.gen(function*() {
-          yield* store.retain({
-            sessionId: request.sessionId,
-            messageId: inserted.messageId,
-            role: "user",
-            replacement: [...request.prompt],
-            chunks: [],
-            recordedAt: yield* DateTime.now
-          }).pipe(Effect.tapCause(logPrivateError), Effect.mapError(toRemote))
-
-          if (state.cancelled) {
+          const insert = handler(Effect.suspend(() => options.prompt.insert({ ...context, prompt: request.prompt })))
+          const retain = (messageId: string) => Effect.gen(function*() {
+            yield* store.retain({
+              sessionId: request.sessionId, messageId, role: "user",
+              replacement: [...request.prompt], chunks: [], recordedAt: yield* DateTime.now
+            }).pipe(Effect.tapCause(logPrivateError))
+          })
+          const start = (messageId: string, before: Effect.Effect<void, HandlerError>) => Effect.gen(function*() {
+            const started = yield* Deferred.make<void>()
+            const completed = yield* Deferred.make<StopReason, HandlerError>()
+            const work = Deferred.await(started).pipe(Effect.andThen(execute(context, request.prompt, messageId, before)),
+              Effect.catchCauseIf((cause) => state.cancelled && Cause.hasInterruptsOnly(cause),
+                () => Effect.succeed<StopReason>("cancelled")),
+              Effect.ensuring(Effect.sync(() => { state.running = undefined })),
+              Effect.onExit((exit) => state.cancelled && Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)
+                ? Deferred.succeed(completed, "cancelled")
+                : Deferred.done(completed, exit)))
+            const fiber = yield* Effect.forkIn(Effect.interruptible(work), state.scope)
+            state.running = fiber
             state.inserting = false
-            return yield* new AcpRemoteError({ code: ErrorCode.RequestCancelled, message: "Request cancelled" })
-          }
-
-          const started = yield* Deferred.make<void>()
-          const completed = yield* Deferred.make<StopReason, HandlerError>()
-          const work = Deferred.await(started).pipe(Effect.andThen(execute(context, request.prompt, inserted.messageId)),
-            Effect.catchCauseIf((cause) => state.cancelled && Cause.hasInterruptsOnly(cause),
-              () => Effect.succeed<StopReason>("cancelled")),
-            Effect.ensuring(Effect.sync(() => { state.running = undefined })),
-            Effect.onExit((exit) => state.cancelled && Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)
-              ? Deferred.succeed(completed, "cancelled")
-              : Deferred.done(completed, exit)))
-          const fiber = yield* Effect.forkIn(Effect.interruptible(work), state.scope)
-          state.running = fiber
-          state.inserting = false
-          yield* Deferred.succeed(started, undefined)
-          return { fiber, completed }
-          }).pipe(Effect.ensuring(Effect.sync(() => { state.inserting = false }))))
-          if (current.version === 1) return { stopReason: yield* Deferred.await(completed).pipe(Effect.onInterrupt(() => Fiber.interrupt(fiber))) }
-          return { messageId: inserted.messageId }
+            yield* Deferred.succeed(started, undefined)
+            return { fiber, completed }
+          })
+          return yield* Effect.gen(function*() {
+            if (current.version === 2) {
+              // Successful author insertion is the acknowledgement boundary.
+              // Retention and foreground work belong to the session, so their
+              // failures or cancellation cannot replace its committed result.
+              return yield* Effect.uninterruptibleMask((restore) => Effect.gen(function*() {
+                const acceptance = insert.pipe(
+                  Effect.map(({ messageId }) => ({ messageId })),
+                  Effect.tap((result) => Schema.encodeEffect(V2.PromptResponse)(result).pipe(
+                    Effect.mapError(() => new AcpRemoteError({ code: ErrorCode.InternalError, message: "Invalid handler result" }))))
+                )
+                const inserted = yield* requestContext.commitResult(restore(acceptance))
+                if (!state.cancelled && sessions.get(request.sessionId) === state) {
+                  yield* start(inserted.messageId, retain(inserted.messageId))
+                }
+                return inserted
+              }))
+            }
+            const inserted = yield* insert
+            const { fiber, completed } = yield* Effect.uninterruptible(Effect.gen(function*() {
+              yield* retain(inserted.messageId).pipe(Effect.mapError(toRemote))
+              if (state.cancelled) return yield* new AcpRemoteError({ code: ErrorCode.RequestCancelled, message: "Request cancelled" })
+              return yield* start(inserted.messageId, Effect.void)
+            }))
+            return { stopReason: yield* Deferred.await(completed).pipe(Effect.onInterrupt(() => Fiber.interrupt(fiber))) }
+          }).pipe(Effect.ensuring(Effect.sync(() => { state.inserting = false })))
         })
 
       const cancelSession = (params: unknown) =>
@@ -859,29 +893,38 @@ const build = <R>(options: Options<R>): AcpAgent<R> => {
           const { sessionId } = yield* decodeInput(SessionInput, params)
           const state = sessions.get(sessionId)
           const current = peer
+          if (state?.cancellation) return yield* Deferred.await(state.cancellation)
+          const cancellation = yield* Deferred.make<void, HandlerError>()
           if (state) {
+            state.cancellation = cancellation
             state.cancelled = true
             state.cancelling = true
           }
           yield* Effect.gen(function*() {
             const running = state?.running
+            let failure: AcpRemoteError | undefined
             if (running) {
               // Interrupting drains the execution's finalizers (its final
               // updates) before we report the cancelled stop reason.
               yield* Fiber.interrupt(running)
+              const exit = yield* Fiber.await(running)
+              if (Exit.isFailure(exit) && !Cause.hasInterruptsOnly(exit.cause)) failure = toRemote(undefined)
               if (state.running === running) state.running = undefined
             }
             if (options.session.cancel && current) {
               yield* options.session.cancel({ sessionId, version: current.version, peer: current }).pipe(Effect.ignore)
             }
-            if (current && (!state || sessions.get(sessionId) === state)) yield* emitIdle(sessionId, current.version, "cancelled")
-          }).pipe(Effect.ensuring(Effect.sync(() => { if (state) state.cancelling = false })))
+            if (current && (!state || sessions.get(sessionId) === state)) yield* emitIdle(sessionId, current.version, failure ? "error" : "cancelled", failure)
+          }).pipe(
+            Effect.onExit((exit) => Deferred.done(cancellation, exit)),
+            Effect.ensuring(Effect.sync(() => { if (state) { state.cancelling = false; state.cancellation = undefined } }))
+          )
         })
 
       const routes: Array<AcpConnection.Route> = [
         { _tag: "Request", method: "initialize", run: (params) => initialize(params) },
         { _tag: "Request", method: "session/new", run: (params) => newSession(params) },
-        { _tag: "Request", method: "session/prompt", run: (params) => provided(prompt(params)).pipe(Effect.tapCause(logPrivateError), Effect.mapError(toRemote)) },
+        { _tag: "Request", method: "session/prompt", run: (params, context) => provided(prompt(params, context)).pipe(Effect.tapCause(logPrivateError), Effect.mapError(toRemote)) },
         {
           _tag: "Notification",
           method: "session/cancel",
@@ -961,8 +1004,15 @@ const build = <R>(options: Options<R>): AcpAgent<R> => {
               const current = yield* requirePeer
               const { sessionId } = yield* decodeInput(SessionInput, params)
               yield* requireSession(sessionId)
-              yield* handler(close({ sessionId, version: current.version, peer: current }))
-              yield* ended(sessionId)
+              const state = sessions.get(sessionId)
+              if (state) state.closing = true
+              yield* Effect.gen(function*() {
+                if (current.version === 2 && (state?.running || state?.inserting || state?.cancelling)) {
+                  yield* provided(cancelSession({ sessionId })).pipe(Effect.uninterruptible, Effect.mapError(toRemote))
+                }
+                yield* handler(close({ sessionId, version: current.version, peer: current }))
+                yield* ended(sessionId)
+              }).pipe(Effect.ensuring(Effect.sync(() => { if (state) state.closing = false })))
               return {}
             })
         })

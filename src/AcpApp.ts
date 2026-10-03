@@ -8,6 +8,7 @@
  * handles, so snapshots stay serializable for future hosted/gateway use.
  */
 import * as Schema from "effect/Schema"
+import * as Effect from "effect/Effect"
 import { RequestId } from "./AcpSchema.ts"
 import * as V1 from "./protocol/v1/Schema.ts"
 import * as V2 from "./protocol/v2/Schema.ts"
@@ -487,7 +488,7 @@ export type ToolCallSnapshot = {
   readonly name: string | null
   readonly kind: V2.ToolKind | null
   readonly status: V2.ToolCallStatus | null
-  readonly content: ReadonlyArray<V2.ToolCallContent> | null
+  readonly content: ReadonlyArray<V1.ToolCallContent | V2.ToolCallContent> | null
   readonly locations: ReadonlyArray<V2.ToolCallLocation> | null
   readonly rawInput: unknown
   readonly rawOutput: unknown
@@ -505,7 +506,7 @@ export const ToolCallSnapshot: Schema.Codec<ToolCallSnapshot> = Schema.Struct({
   name: Schema.Union([Schema.String, Schema.Null]),
   kind: Schema.Union([V2.ToolKind, Schema.Null]),
   status: Schema.Union([V2.ToolCallStatus, Schema.Null]),
-  content: Schema.Union([Schema.Array(V2.ToolCallContent), Schema.Null]),
+  content: Schema.Union([Schema.Array(Schema.Union([V1.ToolCallContent, V2.ToolCallContent])), Schema.Null]),
   locations: Schema.Union([Schema.Array(V2.ToolCallLocation), Schema.Null]),
   rawInput: Schema.Unknown,
   rawOutput: Schema.Unknown,
@@ -557,6 +558,8 @@ export type TerminalSnapshot = {
   readonly command: string | null
   readonly cwd: string | null
   readonly outputBytes: ReadonlyArray<number>
+  /** True after a concrete exit status, even when its code and signal are unknown. */
+  readonly exited?: boolean
   readonly exitCode: number | null
   readonly exitSignal: string | null
   /**
@@ -575,6 +578,7 @@ export const TerminalSnapshot: Schema.Codec<TerminalSnapshot> = Schema.Struct({
   command: Schema.Union([Schema.String, Schema.Null]),
   cwd: Schema.Union([Schema.String, Schema.Null]),
   outputBytes: Schema.Array(Schema.Int),
+  exited: Schema.Boolean.pipe(Schema.withDecodingDefaultKey(Effect.succeed(false))),
   exitCode: Schema.Union([Schema.Finite, Schema.Null]),
   exitSignal: Schema.Union([Schema.String, Schema.Null]),
   outputTruncated: Schema.Boolean,
