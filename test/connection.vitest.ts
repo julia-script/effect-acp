@@ -42,6 +42,74 @@ const harness = (options?: AcpConnection.Options) =>
     return { connection, peer, connectionScope, driverScope }
   })
 
+describe("review regressions", () => {
+  it.effect("child interruption in a notification leaves later delivery and owner cleanup live", () =>
+    run(Effect.gen(function*() {
+      const seen: Array<string> = []
+      const { connection, peer, connectionScope } = yield* harness({ handlers: {
+        request: () => Effect.succeed({ ok: true }),
+        notification: (method) => method === "_interrupt" ? Effect.gen(function*() {
+          const worker = yield* Effect.forkChild(Effect.interrupt)
+          return yield* Fiber.join(worker)
+        }) : Effect.sync(() => { seen.push(method) })
+      } })
+      for (const method of ["_before", "_interrupt", "_after"]) yield* peer.send({ jsonrpc: "2.0", method })
+      yield* peer.send({ jsonrpc: "2.0", id: 1, method: "_barrier" })
+      expect(yield* peer.next).toMatchObject({ id: 1, result: { ok: true } })
+      yield* connection.drainNotifications
+      expect(seen).toEqual(["_before", "_after"])
+      yield* connection.setHandlers({ request: () => Effect.succeed(null), notification: () => Effect.sync(() => { seen.push("replaced") }) })
+      yield* peer.send({ jsonrpc: "2.0", method: "_later" })
+      yield* peer.send({ jsonrpc: "2.0", id: 2, method: "_barrier" })
+      yield* peer.next
+      yield* connection.drainNotifications
+      expect(seen).toEqual(["_before", "_after", "replaced"])
+      yield* Scope.close(connectionScope, Exit.void)
+      expect((yield* connection.closed).message).toBe("Connection closed")
+    })))
+
+  it.effect("invalid constructed remote error codes never reach the wire", () =>
+    run(Effect.gen(function*() {
+      const { peer } = yield* harness({ handlers: { request: (_method, params) =>
+        Effect.fail(new AcpRemoteError({ code: Number(field(params, "code")), message: "custom error", data: { visible: true } }))
+      } })
+      for (const [id, code] of [[1, 1.5], [2, -32001], [3, 42]] as const) {
+        yield* peer.send({ jsonrpc: "2.0", id, method: "_error", params: { code } })
+        expect(yield* peer.next).toEqual({ jsonrpc: "2.0", id, error: code === 1.5
+          ? { code: -32603, message: "Internal error" }
+          : { code, message: "custom error", data: { visible: true } } })
+      }
+    })))
+
+  it.effect("a committed result survives later handler failure", () =>
+    run(Effect.gen(function*() {
+      const { peer } = yield* harness({ handlers: { request: (_method, _params, context) =>
+        context.commitResult(Effect.succeed({ messageId: "accepted" })).pipe(
+          Effect.andThen(Effect.fail(new AcpRemoteError({ code: -32603, message: "storage failed" })))
+        )
+      } })
+      yield* peer.send({ jsonrpc: "2.0", id: 1, method: "_insert" })
+      expect(yield* peer.next).toEqual({ jsonrpc: "2.0", id: 1, result: { messageId: "accepted" } })
+    })))
+
+  it.effect("cancellation before the acceptance boundary interrupts preparation", () =>
+    run(Effect.gen(function*() {
+      const started = yield* Deferred.make<void>()
+      const stopped = yield* Deferred.make<void>()
+      const { peer } = yield* harness({ handlers: { request: (_method, _params, context) =>
+        Deferred.succeed(started, undefined).pipe(
+          Effect.andThen(Effect.never), Effect.onInterrupt(() => Deferred.succeed(stopped, undefined)),
+          Effect.andThen(context.commitResult(Effect.succeed({ messageId: "never-inserted" })))
+        )
+      } })
+      yield* peer.send({ jsonrpc: "2.0", id: 1, method: "_insert" })
+      yield* Deferred.await(started)
+      yield* peer.send({ jsonrpc: "2.0", method: "$/cancel_request", params: { requestId: 1 } })
+      expect(yield* peer.next).toMatchObject({ id: 1, error: { code: -32800 } })
+      yield* Deferred.await(stopped)
+    })))
+})
+
 describe("in-memory transport", () => {
   it.effect("ordered duplex exchange", () =>
     run(Effect.gen(function*() {

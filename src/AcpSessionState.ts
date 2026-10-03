@@ -252,10 +252,12 @@ const reduceToolCall = (
   const next: ToolCallSnapshot = {
     ...previous,
     title: patch(Schema.String, update, "title", previous.title),
-    name: patch(Schema.String, update, "name", previous.name),
+    name: snapshot.version === 1 && update.name == null ? previous.name : patch(Schema.String, update, "name", previous.name),
     kind: patch(V2.ToolKind, update, "kind", previous.kind),
     status: patch(V2.ToolCallStatus, update, "status", previous.status),
-    content: patch(Schema.Array(V2.ToolCallContent), update, "content", previous.content),
+    content: snapshot.version === 1
+      ? patch(Schema.Array(V1.ToolCallContent), update, "content", previous.content)
+      : patch(Schema.Array(V2.ToolCallContent), update, "content", previous.content),
     locations: patch(Schema.Array(V2.ToolCallLocation), update, "locations", previous.locations),
     rawInput: supplied(update, "rawInput") ? update["rawInput"] : previous.rawInput,
     rawOutput: supplied(update, "rawOutput") ? update["rawOutput"] : previous.rawOutput,
@@ -303,6 +305,7 @@ const reduceTerminalUpdate = (
     command: null,
     cwd: null,
     outputBytes: [],
+    exited: false,
     exitCode: null,
     exitSignal: null,
     outputTruncated: false,
@@ -323,6 +326,7 @@ const reduceTerminalUpdate = (
     command: patch(Schema.String, update, "command", previous.command),
     cwd: patch(Schema.String, update, "cwd", previous.cwd),
     outputBytes: capped,
+    exited: supplied(update, "exitStatus") ? exited : previous.exited ?? false,
     exitCode: exited ? exitStatus.exitCode ?? null : retainedExitCode,
     exitSignal: exited ? exitStatus.signal ?? null : retainedExitSignal,
     outputTruncated: replaced ? truncated : previous.outputTruncated || truncated,
@@ -368,6 +372,7 @@ const reduceTerminalOutputChunk = (
     command: previous?.command ?? null,
     cwd: previous?.cwd ?? null,
     outputBytes: capped,
+    exited: previous?.exited ?? false,
     exitCode: previous?.exitCode ?? null,
     exitSignal: previous?.exitSignal ?? null,
     outputTruncated: (previous?.outputTruncated ?? false) || truncated,

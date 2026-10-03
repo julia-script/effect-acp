@@ -35,7 +35,11 @@ The constructed agent's `serve` Effect requires `AcpTransport`, `Store`, handler
 
 Session context includes `sessionId`, selected `version`, and `peer`. The peer contains client info, advertised elicitation modes, and the decoded initialize request. Execution handlers obtain workspace or conversation details from application state using the session ID; `execute` does not receive a `cwd` field directly.
 
-Stop reasons are `end_turn`, `max_tokens`, `max_turn_requests`, `refusal`, and `cancelled`. v1 returns one in the prompt response. v2 acknowledges successful insertion separately and ends foreground execution with an idle update after final output. Cancellation interrupts the session-owned turn and drains its finalizers.
+Stop reasons are `end_turn`, `max_tokens`, `max_turn_requests`, `refusal`, `cancelled`, and `error`. v1 returns its compatible stop reason in the prompt response; `error` maps to `refusal` on v1. v2 acknowledges successful insertion separately and ends foreground execution with an idle update after final output. Failed v2 execution or input retention reports `error`, with a sanitized JSON-RPC error when available. A deliberate refusal remains `refusal`.
+
+Once `prompt.insert` succeeds on v2, its message ID is the successful acknowledgement even if retention fails or request cancellation arrives. Retention and execution run in the session-owned scope. Request cancellation before the insertion phase can interrupt the request. During `prompt.insert`, request cancellation waits for its accepted message ID or rejection, because the helper cannot inspect an application-owned conversation transaction. The insertion remains interruptible when the owning connection closes. After insertion, cancelling the prompt RPC does not cancel foreground work. `session/cancel` interrupts the session-owned turn and drains its finalizers before reporting idle. Closing an active v2 session performs the same cancellation before calling the optional close handler and releasing session resources.
+
+Terminal authentication methods are advertised only when the initializing client enables terminal authentication (`clientCapabilities.auth.terminal: true` on v1, or a non-null `capabilities.auth.terminal` object on v2). Other authentication methods remain available.
 
 ## Output and client interactions
 
@@ -51,7 +55,7 @@ Stop reasons are `end_turn`, `max_tokens`, `max_turn_requests`, `refusal`, and `
 
 Chunk helpers omit message identity on v1. Full replacements fail on v1. Message IDs must be meaningful and stable in the author's conversation model.
 
-`HandlerError` includes agent/store and protocol communication failures. `AcpAgentError` carries code, message, and optional data. `unknownSession` and `authRequired` construct common failures. Request-handler defects receive a generic Internal error response. Non-interruption failures during turn execution are logged generically and reported as a refusal completion.
+`HandlerError` includes agent/store and protocol communication failures. `AcpAgentError` carries code, message, and optional data. `unknownSession` and `authRequired` construct common failures. Request-handler defects receive a generic Internal error response. Non-interruption failures during turn execution report `error` on v2 and retain the existing `refusal` completion on v1. Internal defects receive a generic error message.
 
 ## Store service
 

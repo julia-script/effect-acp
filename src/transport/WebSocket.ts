@@ -61,11 +61,12 @@ export interface Options {
    */
   readonly buffer?: number | undefined
   /**
-   * How long to wait for the socket to open. Passed to `Socket.fromWebSocket`.
+   * How long to wait for the socket to open. Default 10 seconds.
    */
   readonly openTimeout?: Duration.Input | undefined
   /**
-   * Buffered bytes before a non-pausing socket fails. Passed to `Socket.fromWebSocket`.
+   * Buffered inbound bytes before a non-pausing socket fails. Default 16 MiB.
+   * Pausable sockets pause at this limit; callback transports close on overflow.
    */
   readonly highWaterMark?: number | undefined
 }
@@ -73,6 +74,20 @@ export interface Options {
 const encoder = new TextEncoder()
 
 const frameBytes = (frame: string): number => encoder.encode(frame).byteLength
+
+// Native sockets accept protocol close codes; browser clients only allow 1000
+// or application codes. Closing must never replace the transport's typed error.
+const closeSocket = (ws: Socket.WebSocketLike, code = 1000, reason?: string): void => {
+  try {
+    ws.close(code, reason)
+  } catch {
+    try {
+      ws.close(1000)
+    } catch {
+      // A failed underlying close cannot be recovered by this adapter.
+    }
+  }
+}
 
 const closedError = new AcpTransportError({ reason: "Closed", message: "WebSocket transport is closed" })
 
@@ -213,16 +228,91 @@ export const make = <E = never, R = never>(
   Effect.gen(function*() {
     const constructor = yield* Socket.WebSocketConstructor
     const resolved = typeof url === "string" ? url : yield* url
-    const socket = Socket.fromWebSocket(
-      Effect.acquireRelease(
-        dial(constructor, resolved).pipe(Effect.interruptible, Effect.timeoutOrElse({
-          duration: options.openTimeout ?? "10 seconds", orElse: () => Effect.fail(openFailure("WebSocket open timeout"))
-        })),
-        (ws) => Effect.sync(() => ws.close(1000))
-      ),
-      { openTimeout: options.openTimeout, highWaterMark: options.highWaterMark }
+    const maxFrameBytes = options.maxFrameBytes ?? 16 * 1024 * 1024
+    const buffer = options.buffer ?? 64
+    const highWaterMark = options.highWaterMark ?? 16 * 1024 * 1024
+    if (![maxFrameBytes, buffer, highWaterMark].every((limit) => Number.isSafeInteger(limit) && limit > 0)) {
+      return yield* new AcpTransportError({ reason: "Open", message: "WebSocket limits must be positive finite integers" })
+    }
+    const ws = yield* Effect.acquireRelease(
+      dial(constructor, resolved).pipe(Effect.interruptible, Effect.timeoutOrElse({
+        duration: options.openTimeout ?? "10 seconds", orElse: () => Effect.fail(openFailure("WebSocket open timeout"))
+      }), Effect.mapError((cause) => new AcpTransportError({ reason: "Open", message: "WebSocket failed to open", cause }))),
+      (ws) => Effect.sync(() => closeSocket(ws))
     )
-    return yield* fromSocket(socket, options)
+    const frames = yield* Queue.bounded<string, AcpTransportError | Cause.Done>(buffer)
+    let closed = false
+    let bufferedBytes = 0
+    let paused = false
+    const pause = "pause" in ws && typeof ws.pause === "function" ? ws.pause.bind(ws) : undefined
+    const resume = "resume" in ws && typeof ws.resume === "function" ? ws.resume.bind(ws) : undefined
+    const pausable = pause !== undefined && resume !== undefined
+
+    const fail = (error: AcpTransportError, code = 1011) => {
+      if (closed) return
+      closed = true
+      Queue.failCauseUnsafe(frames, Cause.fail(error))
+      // Close at the callback boundary: neither the queue nor a lower socket reader
+      // can keep accumulating frames while the application stops reading.
+      ws.removeEventListener("message", onMessage)
+      closeSocket(ws, code)
+    }
+    const onMessage = (event: Socket.WebSocketEvent) => {
+      if (closed) return
+      if (typeof event.data !== "string") {
+        fail(new AcpTransportError({ reason: "InvalidFrame", message: "Binary WebSocket frames are not supported" }), unsupportedDataClose)
+        return
+      }
+      const bytes = frameBytes(event.data)
+      if (bytes > maxFrameBytes) {
+        fail(new AcpTransportError({ reason: "FrameTooLarge", message: `Frame exceeds ${maxFrameBytes} bytes` }), tooLargeClose)
+        return
+      }
+      if (bufferedBytes + bytes > highWaterMark || !Queue.offerUnsafe(frames, event.data)) {
+        fail(new AcpTransportError({ reason: "Read", message: "WebSocket inbound capacity exceeded" }), tooLargeClose)
+        return
+      }
+      bufferedBytes += bytes
+      if (pausable && !paused && (bufferedBytes >= highWaterMark || Queue.sizeUnsafe(frames) >= buffer)) {
+        paused = true
+        pause()
+      }
+    }
+    const onError = () => fail(new AcpTransportError({ reason: "Read", message: "WebSocket read failed" }))
+    const onClose = () => {
+      if (closed) return
+      closed = true
+      Queue.endUnsafe(frames)
+    }
+    ws.addEventListener("message", onMessage)
+    ws.addEventListener("error", onError)
+    ws.addEventListener("close", onClose)
+    yield* Effect.addFinalizer(() => Effect.sync(() => {
+      ws.removeEventListener("message", onMessage)
+      ws.removeEventListener("error", onError)
+      ws.removeEventListener("close", onClose)
+      closed = true
+      Queue.failCauseUnsafe(frames, Cause.fail(closedError))
+    }))
+    return {
+      incoming: Stream.fromQueue(frames).pipe(Stream.tap((frame) => Effect.sync(() => {
+        bufferedBytes -= frameBytes(frame)
+        if (paused && !closed && bufferedBytes < highWaterMark && Queue.sizeUnsafe(frames) < buffer) {
+          paused = false
+          resume?.()
+        }
+      }))),
+      send: (frame: string) => Effect.suspend(() => {
+        if (closed) return Effect.fail(closedError)
+        if (frameBytes(frame) > maxFrameBytes) {
+          return Effect.fail(new AcpTransportError({ reason: "FrameTooLarge", message: `Frame exceeds ${maxFrameBytes} bytes` }))
+        }
+        return Effect.try({
+          try: () => ws.send(frame),
+          catch: (cause) => new AcpTransportError({ reason: "Write", message: "WebSocket write failed", cause })
+        }).pipe(Effect.tapError((error) => Effect.sync(() => fail(error))))
+      })
+    } satisfies Transport
   })
 
 /** Dials and waits for open, rejecting a peer that did not select the profile. */
@@ -251,7 +341,7 @@ const dial = (
         remove()
         resume(effect)
       }
-      const onOpen = () => finish(selected(ws).pipe(Effect.tapError(() => Effect.sync(() => ws.close(1002, "Subprotocol mismatch")))))
+      const onOpen = () => finish(selected(ws).pipe(Effect.tapError(() => Effect.sync(() => closeSocket(ws, 1002, "Subprotocol mismatch")))))
       const onError = (event: Socket.WebSocketEvent) => finish(Effect.fail(openFailure(event)))
       const onClose = (event: Socket.WebSocketEvent) =>
         finish(Effect.fail(new Socket.SocketError({
@@ -268,11 +358,11 @@ const dial = (
         if (!settled) {
           settled = true
           remove()
-          ws.close(1000)
+          closeSocket(ws)
         }
       })
     })),
-    (ws) => Effect.sync(() => ws.close(1000))
+    (ws) => Effect.sync(() => closeSocket(ws))
   )
 
 const openFailure = (cause: unknown): Socket.SocketError =>

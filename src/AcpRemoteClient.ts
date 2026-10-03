@@ -18,6 +18,7 @@ import { AcpConnectionClosed } from "./AcpError.ts"
 import * as AcpGateway from "./AcpGateway.ts"
 import type { Client } from "./AcpGatewayClient.ts"
 import { AcpCapabilityUnsupported, AcpSessionBusy, AcpSubscriptionOverflow } from "./AcpSessionError.ts"
+import { authMethodId } from "./internal/capabilities.ts"
 
 /**
  * Host launch profile, profile arguments, observer capacity, and retained connection namespace.
@@ -66,7 +67,8 @@ const network = <A, E, R>(effect: Effect.Effect<A, E, R>) => effect.pipe(Effect.
  *
  * Returns connection operations, scoped attachment acquisition, and descriptor lookup for returned
  * session handles. Attachments restore retained snapshots and cursors without reinitializing ACP or
- * resubmitting prompts.
+ * resubmitting prompts. Successful terminal authentication releases the host connection and its
+ * matching retained descriptor; call `connect` again to open and initialize a fresh connection.
  *
  * **Gotchas**
  *
@@ -144,6 +146,7 @@ export const make = (gateway: Client, options: Options) => Effect.gen(function*(
     })
     const incoming = gateway.api.Attach({ epoch: gateway.window.epoch, workspace: gateway.window.workspace,
       clientId: gateway.clientId, session: descriptor.session, takeover,
+      expected: { sessionId: descriptor.sessionId, version: descriptor.version },
       ...(retained ? { cursor: retained.cursor } : {}) })
     yield* network(Stream.runForEach(incoming, receive)).pipe(
       Effect.andThen(failure(AcpGateway.failure("Closed"))), Effect.catch((error) => failure(error)), Effect.forkIn(owned))
@@ -290,6 +293,7 @@ export const make = (gateway: Client, options: Options) => Effect.gen(function*(
       yield* gateway.storage.save(key, { epoch: gateway.window.epoch, operationId, descriptor })
     }
     const connection = descriptor.connection
+    const authMethods = descriptor.negotiated.response.authMethods
     const establish = (command: AcpGateway.Command) => run(command).pipe(Effect.flatMap((value) => Schema.decodeUnknownEffect(AcpGateway.SessionDescriptor)(value).pipe(Effect.mapError(() => AcpGateway.failure("Invalid")))), Effect.flatMap((descriptor) => Scope.provide(attach(descriptor), connectionScope)))
     const sessionOptions = ({ cwd, additionalDirectories, mcpServers }: NewSessionOptions) => ({
       cwd,
@@ -308,7 +312,16 @@ export const make = (gateway: Client, options: Options) => Effect.gen(function*(
         ...(options.replayFrom === undefined ? {} : { replayFrom: options.replayFrom })
       } }),
       listSessions: (cwd) => network(gateway.api.List({ epoch: gateway.window.epoch, workspace: gateway.window.workspace, connection, ...(cwd ? { cwd } : {}) })),
-      authenticate: (methodId) => Effect.asVoid(run({ _tag: "Authenticate", connection, methodId })),
+      authenticate: (methodId) => Effect.gen(function*() {
+        yield* run({ _tag: "Authenticate", connection, methodId })
+        const method = authMethods?.find((method) => authMethodId(method) === methodId)
+        if (method && "type" in method && method.type === "terminal") {
+          yield* Effect.uninterruptible(Effect.gen(function*() {
+            const retained = yield* gateway.storage.load(key).pipe(Effect.flatMap(Schema.decodeUnknownEffect(RetainedConnection)), Effect.mapError(() => AcpGateway.failure("Invalid")))
+            if (retained?.epoch === gateway.window.epoch && retained.descriptor?.connection === connection) yield* gateway.storage.remove(key)
+          }))
+        }
+      }),
       logout: Effect.asVoid(run({ _tag: "Logout", connection }))
     } satisfies AcpAgentConnection
   })

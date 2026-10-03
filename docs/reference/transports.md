@@ -51,8 +51,10 @@ The adapter negotiates **`effect-acp-jsonrpc-v1`**. This version labels framing 
 | --- | --- |
 | `maxFrameBytes` | 16 MiB, inbound and outbound |
 | `buffer` | 64 inbound frames |
-| `openTimeout` | Forwarded to Effect's socket implementation |
-| `highWaterMark` | Forwarded to Effect's socket implementation |
+| `openTimeout` | 10 seconds to open and negotiate the profile |
+| `highWaterMark` | 16 MiB of queued inbound bytes when dialing with `make` / `layer` |
+
+Dialed sockets enforce both frame-count and byte bounds at the message callback. Overflow fails the stream and closes the socket; later callbacks cannot accumulate more frames. The adapter attempts code 1009 and falls back to 1000 when the browser rejects protocol close codes. Binary frame and subprotocol rejection use the same fallback. Native sockets with `pause`/`resume` pause at the bound and resume when consumers drain it. Already-acquired sockets passed to `fromSocket` or `layerSocket` must configure their own underlying receive-pressure policy; this adapter bounds the frames it queues after each socket pull.
 
 The profile is package-owned. Neither it nor the hosted gateway claims conformance to an ACP draft HTTP transport. No general ACP HTTP transport adapter is exported by this package.
 

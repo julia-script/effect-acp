@@ -2,7 +2,6 @@ import { expect, it } from "@effect/vitest"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Logger from "effect/Logger"
-import * as Cause from "effect/Cause"
 import * as HttpRouter from "effect/http/HttpRouter"
 import * as Gateway from "../src/AcpGateway.ts"
 import * as Host from "../src/AcpHost.ts"
@@ -23,7 +22,7 @@ for (const denial of ["origin", "authentication"] as const) it.effect(`gateway r
   } finally { (yield* Effect.promise(() => app.dispose()))}
 }))
 
-it.effect("gateway authentication defects are logged with their cause and return only 401", () => Effect.gen(function*() {
+it.effect("gateway authentication defects have safe diagnostics and return only 401", () => Effect.gen(function*() {
   const defect = new Error("private auth secret")
   const logs: Array<Logger.Options<unknown>> = []
   const logger = Logger.make<unknown, void>((entry) => { logs.push(entry) })
@@ -37,7 +36,7 @@ it.effect("gateway authentication defects are logged with their cause and return
     expect(yield* Effect.promise(() => response.text())).not.toContain("private auth secret")
     const diagnostic = logs.filter((entry) => Array.isArray(entry.message) && entry.message[0] === "Gateway authentication failed")
     expect(diagnostic).toHaveLength(1)
-    expect(Cause.isDieReason(diagnostic[0]!.cause.reasons[0]!)).toBe(true)
-    expect(diagnostic[0]!.cause.reasons[0]).toMatchObject({ defect })
+    expect(diagnostic[0]!.cause.reasons).toEqual([])
+    expect(JSON.stringify(diagnostic[0]!.message)).not.toContain("private auth secret")
   } finally { yield* Effect.promise(() => app.dispose()) }
 }))

@@ -5,6 +5,16 @@ import { AcpRemoteError, AcpTransportError } from "../src/AcpError.ts"
 import { GatewayError } from "../src/AcpGateway.ts"
 import { AcpHistoryUnavailable } from "../src/AcpSessionError.ts"
 
+it("remote error codecs require integer codes", () => {
+  for (const code of [1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+    expect(() => new AcpRemoteError({ code, message: "invalid" })).toThrow()
+    expect(Schema.is(AcpRemoteError)({ _tag: "AcpRemoteError", code, message: "invalid" })).toBe(false)
+  }
+  for (const code of [-32603, -32001, 42]) {
+    expect(Schema.is(AcpRemoteError)(new AcpRemoteError({ code, message: "valid" }))).toBe(true)
+  }
+})
+
 it("namespaces error schemas without changing public names or wire tags", () => {
   const transport = new AcpTransportError({ reason: "Open", message: "unavailable" })
   const history = new AcpHistoryUnavailable({ sessionId: "session-1", operation: "replay" })

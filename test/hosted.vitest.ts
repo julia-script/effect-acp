@@ -38,7 +38,7 @@ const session = Effect.gen(function*() {
   return { ...h, handle, descriptor: h.remote.descriptor(handle)! }
 })
 
-it.live("host logs the complete operation cause while retaining a sanitized failure", () => {
+it.live("host logs a safe operation diagnostic while retaining a sanitized failure", () => {
   const defect = new Error("private connection secret")
   const mixed = Cause.fromReasons([
     ...Cause.fail(AcpGateway.failure("Invalid")).reasons,
@@ -61,7 +61,8 @@ it.live("host logs the complete operation cause while retaining a sanitized fail
     expect(yield* Json.encode(operation)).not.toContain("private connection secret")
     const diagnostic = logs.filter((entry) => Array.isArray(entry.message) && entry.message[0] === "Hosted operation failed")
     expect(diagnostic).toHaveLength(1)
-    expect(diagnostic[0]!.cause.reasons).toEqual(mixed.reasons)
+    expect(diagnostic[0]!.cause.reasons).toEqual([])
+    expect(JSON.stringify(diagnostic[0]!.message)).not.toContain("private connection secret")
   }).pipe(Effect.provide(Logger.layer([logger]))))
 })
 
@@ -103,6 +104,30 @@ it.live("retry ledger deduplicates canonically, rejects conflicts and survives c
   yield* Deferred.await(settled)
   expect(code(yield* Effect.exit(h.host.admit(identity, { ...admission, command: { _tag: "Open", options: { b: 2, a: 1 }, profile: "other" } })))).toBe("Conflict")
   expect(h.opens()).toBe(2)
+})))
+
+it.live("retry payload comparison keeps distinct Unicode keys independent of insertion order", () => run(Effect.gen(function*() {
+  const opened = yield* Deferred.make<void>()
+  let launches = 0
+  const host = yield* Host.make({ policy, authorize: () => Effect.void,
+    open: () => Effect.sync(() => { launches++ }).pipe(
+      Effect.andThen(Deferred.succeed(opened, undefined)), Effect.andThen(Effect.never)) })
+  const window = yield* host.hello(identity, { version: 1, workspace: "work", clientId: "client" })
+  const composed = "\u00e9"
+  const decomposed = "e\u0301"
+  const first = yield* host.admit(identity, { window, operationId: "unicode", command: {
+    _tag: "Open", profile: "demo", options: { nested: [{ [composed]: 1, [decomposed]: 2 }] }
+  } })
+  yield* Deferred.await(opened)
+  const retried = yield* host.admit(identity, { window, operationId: "unicode", command: {
+    _tag: "Open", profile: "demo", options: { nested: [{ [decomposed]: 2, [composed]: 1 }] }
+  } })
+  expect(retried.operationId).toBe(first.operationId)
+  expect(retried.status).toBe("admitted")
+  expect(launches).toBe(1)
+  expect(code(yield* Effect.exit(host.admit(identity, { window, operationId: "unicode", command: {
+    _tag: "Open", profile: "demo", options: { nested: [{ [decomposed]: 1, [composed]: 2 }] }
+  } })))).toBe("Conflict")
 })))
 
 it.live("refresh restores pending permission and live output without reinitializing ACP", () => run(Effect.gen(function*() {

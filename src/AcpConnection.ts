@@ -50,6 +50,16 @@ export interface RequestContext {
    * The remote peer's ID for this request.
    */
   readonly id: RequestId
+  /**
+   * Runs an acceptance boundary whose successful value becomes the authoritative RPC result.
+   *
+   * Use for an irreversible insertion that must remain acknowledged after cancellation. The
+   * supplied effect remains interruptible by connection shutdown. Request cancellation waits
+   * until acceptance finishes, because an opaque transaction may already have inserted the
+   * message. Keep cancellable preparation and foreground work outside this boundary. Later
+   * handler failures or request cancellation cannot replace the committed result.
+   */
+  readonly commitResult: <A, R>(effect: Effect.Effect<A, AcpRemoteError, R>) => Effect.Effect<A, AcpRemoteError, R>
 }
 
 /**
@@ -445,16 +455,42 @@ export const make = Effect.fnUntraced(function*(options: Options = {}) {
     }
     const cancelled = Deferred.makeUnsafe<void>()
     active.set(id, cancelled)
+    let committed: JsonRpc.Outgoing | undefined
+    let accepting = false
+    let acceptanceStarted = false
+    const acceptanceDone = Deferred.makeUnsafe<void>()
+    const handlerStarted = Deferred.makeUnsafe<void>()
+    const context: RequestContext = {
+      id,
+      commitResult: (effect) => Effect.uninterruptibleMask((restore) => Effect.suspend(() => {
+        if (acceptanceStarted) return Effect.fail(new AcpRemoteError({ code: ErrorCode.InternalError, message: "Result already committed" }))
+        acceptanceStarted = true
+        accepting = true
+        return restore(effect).pipe(
+          Effect.flatMap((result) => {
+            const message = JsonRpc.success(id, result)
+            return Json.encode(message).pipe(
+              Effect.mapError(() => new AcpRemoteError({ code: ErrorCode.InternalError, message: "Internal error" })),
+              Effect.andThen(Effect.sync(() => { committed = message })),
+              Effect.as(result)
+            )
+          }),
+          Effect.ensuring(Effect.andThen(Effect.sync(() => { accepting = false }), Deferred.succeed(acceptanceDone, undefined)))
+        )
+      }))
+    }
     // Handler construction happens inside the protected effect, so a handler
     // that throws synchronously still yields an Internal error response.
     const handle = Deferred.await(ready).pipe(
       Effect.andThen(Effect.suspend(() => {
-        const effect = current?.request?.(method, params, { id })
+        const effect = current?.request?.(method, params, context)
         return effect === undefined
           ? Effect.succeed(JsonRpc.failure(id, ErrorCode.MethodNotFound, "Method not found"))
           : Effect.map(effect, (result) => JsonRpc.success(id, result))
       })),
-      Effect.catchTag("AcpRemoteError", (error) => Effect.succeed(JsonRpc.failure(id, error.code, error.message, error.data))),
+      Effect.catchTag("AcpRemoteError", (error) => Effect.succeed(Number.isInteger(error.code)
+        ? JsonRpc.failure(id, error.code, error.message, error.data)
+        : JsonRpc.failure(id, ErrorCode.InternalError, "Internal error"))),
       Effect.flatMap((message) => Json.encode(message).pipe(
         Effect.as(message),
         Effect.catchTag("SchemaError", (error) => Effect.logError(`Handler for ${method} returned non-serializable data`, error).pipe(
@@ -466,6 +502,7 @@ export const make = Effect.fnUntraced(function*(options: Options = {}) {
     // connection. Observe its exit as a value so the response fiber survives.
     const completed = Effect.gen(function*() {
       const fiber = yield* Effect.forkChild(handle, { startImmediately: true })
+      yield* Deferred.succeed(handlerStarted, undefined)
       return yield* Fiber.await(fiber).pipe(
         Effect.flatMap((exit) => {
           if (Exit.isSuccess(exit)) return Effect.succeed(exit.value)
@@ -478,10 +515,18 @@ export const make = Effect.fnUntraced(function*(options: Options = {}) {
         Effect.ensuring(Effect.asVoid(Effect.forkDetach(Fiber.interrupt(fiber))))
       )
     })
-    return Effect.raceFirst(
-      completed,
-      Effect.as(Deferred.await(cancelled), JsonRpc.failure(id, ErrorCode.RequestCancelled, "Request cancelled"))
-    ).pipe(Effect.ensuring(Effect.sync(() => active.delete(id))))
+    const cancel = Effect.gen(function*() {
+      yield* Deferred.await(cancelled)
+      yield* Deferred.await(handlerStarted)
+      if (accepting) {
+        yield* Deferred.await(acceptanceDone)
+      }
+      return committed ?? JsonRpc.failure(id, ErrorCode.RequestCancelled, "Request cancelled")
+    })
+    return Effect.raceFirst(completed, cancel).pipe(
+      Effect.map((message) => committed ?? message),
+      Effect.ensuring(Effect.sync(() => active.delete(id)))
+    )
   }
 
   /**
@@ -563,9 +608,14 @@ export const make = Effect.fnUntraced(function*(options: Options = {}) {
       if (entry._tag === "Barrier") return Deferred.succeed(entry.completed, undefined)
       const { method, params } = entry
       return Deferred.await(ready).pipe(
-        Effect.andThen(Effect.suspend(() => current?.notification?.(method, params) ?? Effect.void)),
-        Effect.catchCauseIf((cause) => !Cause.hasInterruptsOnly(cause), (cause) => Effect.logWarning(`Notification handler for ${method} failed`, cause)
-        )
+        Effect.andThen(Effect.gen(function*() {
+          const handler = Effect.suspend(() => current?.notification?.(method, params) ?? Effect.void)
+          const fiber = yield* Effect.forkChild(handler, { startImmediately: true })
+          const exit = yield* Fiber.await(fiber)
+          if (Exit.isFailure(exit) && !Cause.hasInterruptsOnly(exit.cause)) {
+            yield* Effect.logWarning(`Notification handler for ${method} failed`, exit.cause)
+          }
+        }))
       )
     }),
     Effect.forever,
